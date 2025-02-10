@@ -1,0 +1,126 @@
+---
+title: "concat_zero_offset_00"
+format: html
+editor: visual
+author: Taylor Azizeh
+contact: taylorazizeh@gmail.com
+date: 01 April 2024
+---
+
+## Concatenate zero offset dive data
+
+Since the raw penguin data is not zero-offset, it has been put through MATLAB/IKNOS to produce zero-offset dive data. The original sampling frequency is at 100Hz for the 2019 data and 50Hz at 2022. The ZOC depth data is at 1Hz.
+
+##### OPTION 1: These first code chunks run the files through one-by-one.
+
+```{r load libraries}
+library(data.table)
+library(dplyr)
+library(future)
+library(zoo)
+library(ggplot2)
+```
+
+```{r import data}
+# Set working directory to raw data
+setwd("/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2019/Axytrek/Raw data/RAW.CSV")
+
+# Read in the raw data
+data <- fread("19EP_304f.csv", select = c("Date", "Time", "X", "Y", "Z", "Depth", "location-lat", "location-lon"))
+head(data)
+
+# Set working directory to ZOC data
+setwd("/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2019/Axytrek/Time, pressure, ZOC")
+
+# Import ZOC data
+zoc <- fread("19EP_304f_raw_DAprep_full_iknos_rawzoc_data.csv", select = c("CorrectedDepth", "time"))
+head(zoc)
+```
+
+```{r create common column}
+# Create a new column for an arbitrary "ID" value
+data <- cbind(ID = NA, data)
+zoc <- cbind(ID = NA, zoc)
+
+# Fill the column with the desired counting pattern
+data$ID <- seq(1, nrow(data))  # Increment by 1
+zoc$ID <- c(1, seq(from = 100, by = 100, length.out = nrow(zoc) - 1)) # Use 50 for 2022 data and 100 for 2019 data
+
+# Print the resulting data frame
+head(data)
+head(zoc)
+```
+
+```{r merge}
+# Merge the zoc data with the raw data
+merged_data <- data %>%
+  left_join(zoc, by = "ID")
+
+# Print the resulting merged data frame
+head(merged_data)
+```
+
+```{r export}
+# Export data
+out.direx <- "/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2019/Processed files/Concatenated zero offset + raw data/19EP_304f_concat.csv"
+
+fwrite(merged_data, out.direx)
+```
+
+##### OPTION 2: This loop runs through all of the files one after the other.
+
+```{r loop for all files}
+# Load necessary library
+library(data.table)
+
+# Define the base directory
+base_dir <- "\Users/vertlab/Documents/Taylor Azizeh/Raw data"
+
+# Directories
+main_dir <- base_dir
+zoc_dir <- file.path(base_dir, "ZOC")
+output_dir <- "/Users/vertlab/Documents/Taylor Azizeh/Data prep/concat_zero_offset_00/Output"
+
+# File patterns (to match files in the directory)
+main_file_pattern <- "19EP_302.*\\.csv$" # Regex pattern to match files
+
+# List files in main directory matching pattern
+main_files <- list.files(main_dir, pattern = main_file_pattern, full.names = TRUE)
+
+# Process each file in the main directory
+for (main_file_path in main_files) {
+  # Extract file name and create a corresponding ZOC file name
+  main_file_name <- basename(main_file_path)
+  zoc_file_name <- gsub("302c", "302d_raw_DAprep_full_iknos_rawzoc_data", main_file_name)
+  
+  # Read in the main data file
+  data <- fread(main_file_path, select = c("Timestamp", "X", "Y", "Z", "Depth", "location-lat", "location-lon"))
+  data <- cbind(ID = NA, data)
+  data$ID <- seq(1, nrow(data))
+  
+  # Prepare ZOC file path
+  zoc_file_path <- file.path(zoc_dir, zoc_file_name)
+  
+  # Check if ZOC file exists and process
+  if (file.exists(zoc_file_path)) {
+    zoc <- fread(zoc_file_path, select = c("CorrectedDepth", "time"))
+    zoc <- cbind(ID = NA, zoc)
+    zoc$ID <- c(1, seq(from = 50, by = 50, length.out = nrow(zoc) - 1))
+    
+    # Merge the data
+    merged_data <- merge(data, zoc, by = "ID", all.x = TRUE)
+    
+    # Define output file name and path
+    output_file_name <- gsub("\\.csv$", "_fullraw_ZOC.csv", main_file_name)
+    output_file_path <- file.path(output_dir, output_file_name)
+    
+    # Write merged data to file
+    fwrite(merged_data, output_file_path)
+    print(paste("Processed and written:", output_file_path))
+  } else {
+    print(paste("ZOC file not found for", main_file_name))
+  }
+}
+
+print("All processing complete.")
+```
