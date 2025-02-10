@@ -1,0 +1,62 @@
+---
+title: "Clean_5min_interp_GPS"
+format: html
+editor: visual
+---
+
+## Standardize GPS timestamps
+
+**Author**: Taylor Azizeh
+
+**Date**: January 15 2024
+
+**Description**: GPS files were originally interpolated to 5-min time intervals by Dr. Caitlin Kroeger. This code is used to standardize all timestamps into the same format for further analysis.
+
+```{r}
+# Load libraries
+library(dplyr)
+library(lubridate)
+```
+
+```{r}
+# Load in GPS data
+gps_folder <- "/Users/taylorazizeh/Documents/Research/active/Emperor penguins/data/cleaned/gps interpolated"
+```
+
+```{r}
+# List all files matching the naming convention for both years
+gps_files <- list.files(path = gps_folder, pattern = "^(19|22)EP_\d{3}[a-z]_GPS_5min\.csv$", full.names = TRUE)
+
+# Initialize an empty list to store cleaned data
+cleaned_data_list <- list()
+
+# Create standardize timestmap function
+standardize_timestamp <- function(Timestamp) { # Attempt to parse multiple formats
+  parsed <- case_when( !is.na(ymd_hms(Timestamp)) ~ ymd_hms(Timestamp), # Format: YYYY-MM-DD HH:MM:SS
+                       !is.na(mdy_hm(Timestamp)) ~ mdy_hm(Timestamp), # Format: MM/DD/YY HH:MM
+                       TRUE ~ NA_POSIXct_ # Mark unrecognized timestamps as NA
+  ) return(parsed) }
+```
+
+```{r}
+# Loop through each GPS file
+for (file in gps_files) { # Read the CSV file
+  gps_data <- read.csv(file) 
+  if (!"Timestamp" %in% colnames(gps_data)) { stop(paste("File", file, "does not contain a 'Timestamp' column.")) } # Ensure the Timestamp column exists
+  gps_data <- gps_data %>% mutate( Timestamp = standardize_timestamp(Timestamp) ) # Convert and standardize the Timestamp column
+  if (any(is.na(gps_data$Timestamp))) { warning(paste("Some timestamps in file", file, "could not be parsed.")) } # Check for any parsing issues
+  cleaned_data_list[[file]] <- gps_data } # Append the cleaned data to the list 
+```
+
+```{r}
+# Combine all cleaned data into one dataframe
+combined_cleaned_data <- bind_rows(cleaned_data_list)
+
+combined_cleaned_data <- subset(combined_cleaned_data, select = -c(X, V1)) head(combined_cleaned_data)
+
+# Save the combined data to a new CSV file
+write.csv(combined_cleaned_data, "/Users/taylorazizeh/Documents/Research/active/Emperor penguins/data/cleaned/gps interpolated/fixed timestamps/cleaned_GPS_data_all_years.csv", row.names = FALSE)
+
+# View a sample of the cleaned data
+head(combined_cleaned_data)
+```
