@@ -1,0 +1,76 @@
+---
+title: "interpolate_depth_01"
+author: "Taylor Azizeh"
+format: html
+editor: visual
+author: Taylor Azizeh
+contact: taylorazizeh@gmail.com
+date: 01 April 2024
+---
+
+## Interpolate depth data
+
+Since the ZOC depth data is at 1Hz, it needs to be interpolated up to 100Hz so that the data can be decimated while retaining the depth information.
+
+```{r libraries}
+library(data.table)
+library(dplyr)
+library(future)
+library(plotly)
+library(zoo)
+library(ggplot2)
+```
+
+```{r import data}
+# Set working directory
+setwd('/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2022/Processed files/1Hz/Dive data/time_pressure_corrected_ZOC')
+
+# Import ZOC concat data
+raw <- fread("22EP_308b_DAprep_full_iknos_rawzoc_data.csv")
+head(raw)
+```
+
+```{r interpolate depth}
+# Set the number of workers (cores)
+plan(multisession, workers = 2)
+
+# If it's already a data frame, skip this step
+depth_100 <- data.frame(raw$CorrectedDepth)
+
+# Perform interpolation using na.approx
+depth_100 <- depth_100 %>%
+  mutate_all(~na.approx(.x, na.rm = FALSE))
+
+# Display the result
+print(depth_100)
+
+# Stop the workers
+plan(NULL)
+```
+
+```{r graph depth}
+# Create a depth plot using ggplot2
+ggplot(depth_100, aes(x = rev(seq_along(raw.CorrectedDepth)), y = raw.CorrectedDepth)) +
+  geom_line() +
+  labs(title = "Depth Plot", x = "Time", y = "Depth (meters)") +
+  scale_y_reverse()
+```
+
+```{r export}
+# Replace original data with interpolated data
+raw$CorrectedDepth <- depth_100
+head(raw$CorrectedDepth)
+
+# Combine Date and Time columns with a space in between
+raw$Timestamp <- paste(raw$Date, raw$Time)
+
+# Confirm the structure of the new Timestamp column
+str(raw$Timestamp)
+
+# Preview the first few rows
+head(raw$Timestamp)
+
+# Export original data with replaced interpolated depth data
+out.direx <- "/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2019/Axytrek/Depth interpolated/19EP_304f_inter_depth.csv"
+fwrite(raw, out.direx)
+```
