@@ -1,4 +1,4 @@
-# Title: Interpolate 1Hz depth
+# Interpolate 1Hz depth
 ### Date: 10 February 2024
 ### Author: Taylor Azizeh  
 ### Contact: taylorazizeh@gmail.com  
