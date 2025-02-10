@@ -1,4 +1,4 @@
-# Title: Concatenate zero offset and raw data  
+# Concatenate zero offset and raw data  
 ### Date: 10 February 2024  
 ### Author: Taylor Azizeh  
 ### Contact: taylorazizeh@gmail.com  
