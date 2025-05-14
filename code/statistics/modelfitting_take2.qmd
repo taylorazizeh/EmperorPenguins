@@ -1,0 +1,871 @@
+---
+title: "Thesis model fitting - February 2025"
+author: "Taylor Azizeh"
+format: pdf
+freeze: true  # Prevents code from running again
+---
+
+# Overview
+
+**Author**: Taylor Azizeh
+
+**Date**: 14 February 2025
+
+**Description**: This code runs through my thesis model fitting for each of my hypotheses.
+
+Following the model selection process in the Zuur book, each hypothesis follows these steps:
+
+a\. Exploratory plots
+
+b\. Check data distribution.
+
+c\. Fit models and evaluate for best fit using AIC.
+
+d\. Evaluate residuals for best fit model.
+
+------------------------------------------------------------------------
+
+# Model selection
+
+```{r load libraries}
+library(tidyverse) # for general reordering, restructuring
+library(ggplot2) # for plotting
+library(dplyr) # for general reordering, restructuring
+library(MASS)  # for negative binomial
+library(lme4)  # for mixed models
+library(glmmTMB) # for negative binomial + random effects
+library(emmeans) # for pairwise comparison
+library(ggeffects) # for generating model predictions
+library(knitr) # for making tables
+library(performance) # for zero-inflation test
+library(AER) # for overdispersion test
+library(influence.ME) # for Cook's distance test
+```
+
+```{r import data}
+# Read in results table from MATLAB
+results <- read_csv('/Users/taylorazizeh/Documents/research/active/Emperor penguins/results/MATLAB/final/prey_capture_results.csv')
+head(results)
+glimpse(results)
+
+# Read in morphometrics table (sex, mass)
+morpho <- read_csv('/Users/taylorazizeh/Documents/research/active/Emperor penguins/data/cleaned/metadata/metadata.csv')
+head(morpho)
+```
+
+## **H1**: The rate of prey capture attempts will be highest in the bottom phase of the dive, where emperor penguins are believed to be primarily hunting.
+
+### a. Exploratory plots
+
+```{r h1 exploratory plots}
+# Prey capture per dive phase boxplot
+ggplot(results) +
+  geom_boxplot(aes(x = "To Events", y = ToEvents, fill = "To Phase"), alpha = 0.7) +
+  geom_boxplot(aes(x = "Destination Phase", y = DestEvents, fill = "Destination Phase"), alpha = 0.7) +
+  geom_boxplot(aes(x = "From Phase", y = FromEvents, fill = "From Phase"), alpha = 0.7) +
+  labs(x = "Dive Phase", y = "Prey Capture Events",
+       title = "Prey Capture Events Across Dive Phases (With Outliers)") +
+  theme_minimal()
+
+# Mean prey capture events w/ confidence intervals barplot
+mean_events <- results %>%
+  summarise(ToMean = mean(ToEvents, na.rm = TRUE),
+            DestMean = mean(DestEvents, na.rm = TRUE),
+            FromMean = mean(FromEvents, na.rm = TRUE)) %>%
+  tidyr::pivot_longer(cols = everything(), names_to = "Phase", values_to = "MeanEvents")
+
+ggplot(mean_events, aes(x = Phase, y = MeanEvents, fill = 
+                          )) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  labs(x = "Dive Phase", y = "Mean Prey Capture Events",
+       title = "Mean Prey Capture Events per Dive Phase") +
+  theme_minimal()
+
+# Violin plot showing density of prey capture events
+ggplot(results) +
+  geom_violin(aes(x = "To Phase", y = ToEvents, fill = "To Phase"), alpha = 0.6) +
+  geom_violin(aes(x = "Destination Phase", y = DestEvents, fill = "Destination Phase"), alpha = 0.6) +
+  geom_violin(aes(x = "From Phase", y = FromEvents, fill = "From Phase"), alpha = 0.6) +
+  labs(x = "Dive Phase", y = "Prey Capture Events",
+       title = "Density of Prey Capture Events Across Dive Phases") +
+  theme_minimal()
+
+# Dive duration and prey capture events scatter plot
+ggplot(results, aes(x = DiveDuration, y = TotalEvents)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Trend line
+  labs(x = "Dive Duration (s)", y = "Total Prey Capture Events",
+       title = "Prey Capture Events vs. Dive Duration") +
+  theme_minimal()
+```
+
+Looking at these plots, there is one obvious outlier. I will check the data and see if it seems reasonable or erroneous.
+
+```{r find outlier}
+# Filter for row where prey capture rate is >900
+outlier_row <- results %>% filter(TotalEvents > 900)
+
+# Print the row
+print(outlier_row)
+```
+
+Since the destination phase duration is only 51 seconds, it seems impossible that a penguin would attempt to catch prey 1008 times. I am going to remove this outlier and replot.
+
+```{r remove outlier}
+# Remove outlier row
+results <- results %>% filter(TotalEvents <= 900)
+```
+
+```{r replot h1}
+# Prey capture per dive phase boxplot
+ggplot(results) +
+  geom_boxplot(aes(x = "To Events", y = ToEvents, fill = "To Phase"), alpha = 0.7) +
+  geom_boxplot(aes(x = "Destination Phase", y = DestEvents, fill = "Destination Phase"), alpha = 0.7) +
+  geom_boxplot(aes(x = "From Phase", y = FromEvents, fill = "From Phase"), alpha = 0.7) +
+  labs(x = "Dive Phase", y = "Prey Capture Events",
+       title = "Prey Capture Events Across Dive Phases (Without Outlier)") +
+  theme_minimal()
+
+# Mean prey capture events w/ confidence intervals barplot
+mean_events <- results %>%
+  summarise(ToMean = mean(ToEvents, na.rm = TRUE),
+            DestMean = mean(DestEvents, na.rm = TRUE),
+            FromMean = mean(FromEvents, na.rm = TRUE)) %>%
+  tidyr::pivot_longer(cols = everything(), names_to = "Phase", values_to = "MeanEvents")
+
+ggplot(mean_events, aes(x = Phase, y = MeanEvents, fill = 
+                          )) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  labs(x = "Dive Phase", y = "Mean Prey Capture Events",
+       title = "Mean Prey Capture Events per Dive Phase") +
+  theme_minimal()
+
+# Violin plot showing density of prey capture events
+ggplot(results) +
+  geom_violin(aes(x = "To Phase", y = ToEvents, fill = "To Phase"), alpha = 0.6) +
+  geom_violin(aes(x = "Destination Phase", y = DestEvents, fill = "Destination Phase"), alpha = 0.6) +
+  geom_violin(aes(x = "From Phase", y = FromEvents, fill = "From Phase"), alpha = 0.6) +
+  labs(x = "Dive Phase", y = "Prey Capture Events",
+       title = "Density of Prey Capture Events Across Dive Phases") +
+  theme_minimal()
+
+# Dive duration and prey capture events scatter plot
+ggplot(results, aes(x = DiveDuration, y = TotalEvents)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Trend line
+  labs(x = "Dive Duration (s)", y = "Total Prey Capture Events",
+       title = "Prey Capture Events vs. Dive Duration") +
+  theme_minimal()
+```
+
+That looks much more reasonable.
+
+### b. Check data distribution
+
+```{r h1 distributions}
+# Check data distributions
+par(mfrow = c(1, 3))  # Arrange plots in a row
+hist(results$ToEvents, main = "To Phase Events", xlab = "Prey Capture Events")
+hist(results$DestEvents, main = "Destination Phase Events", xlab = "Prey Capture Events")
+hist(results$FromEvents, main = "From Phase Events", xlab = "Prey Capture Events")
+par(mfrow = c(1, 1))  # Reset plot layout
+
+# If variance > mean, we can consider using a negative binomial model.
+
+## To (descent) Phase
+mean(results$ToEvents)
+var(results$ToEvents)
+
+## Destination (bottom) Phase
+mean(results$DestEvents)
+var(results$DestEvents)
+
+## From (ascent) Phase
+mean(results$FromEvents)
+var(results$FromEvents)
+
+## All phases
+mean(results$TotalEvents)
+var(results$TotalEvents)
+```
+
+Since variance \> mean for all dive phases, I am going to start with a negative binomial GLM model with only the fixed effects. Before that, I'll reformat the data to go into the model correctly.
+
+### c. Model fitting
+
+```{r h1 data reshape}
+# Reshape prey capture events into long format
+results_long <- results %>%
+  pivot_longer(cols = c(ToEvents, DestEvents, FromEvents),
+               names_to = "DivePhase",
+               values_to = "PreyCaptureEvents") %>%
+  dplyr::mutate(DivePhase = dplyr::recode(DivePhase, 
+                            "ToEvents" = "To", 
+                            "DestEvents" = "Dest", 
+                            "FromEvents" = "From")) %>%
+  pivot_longer(cols = c(ToPhaseDuration, DestPhaseDuration, FromPhaseDuration),
+               names_to = "DurationPhase",
+               values_to = "PhaseDuration") %>%
+  dplyr::mutate(DurationPhase = dplyr::recode(DurationPhase, 
+                                "ToPhaseDuration" = "To", 
+                                "DestPhaseDuration" = "Dest", 
+                                "FromPhaseDuration" = "From")) %>%
+  dplyr::filter(DivePhase == DurationPhase)  # Ensure correct matching
+
+results_long <- as.data.frame(results_long)
+
+# Remove DurationPhase
+results_long <- results_long[, !names(results_long) %in% "DurationPhase"]
+
+# Remove the "x" from BirdID in results_long
+results_long <- results_long %>%
+  mutate(BirdID = sub("^x", "", BirdID))  # Removes "x" at the start
+
+# Add in sex and mass
+results_long <- results_long %>%
+  left_join(morpho %>% dplyr::select(BirdID, Sex, StartMass), by = "BirdID")
+
+# Check the structure to confirm removal
+head(results_long)
+colnames(results_long)  # Ensure "DurationPhase" is gone
+```
+
+#### Model 1. A negative binomial model with only fixed effects and offset term to calculate prey capture rate.
+
+```{r h1 model1}
+# Fit the Negative Binomial model with an offset for PhaseDuration
+nb_model1 <- glm.nb(PreyCaptureEvents ~ DivePhase + offset(log(PhaseDuration)), 
+                   data = results_long)
+
+summary(nb_model1)
+```
+
+##### Model 1 Interpretation
+
+-   **AIC**: 504,735
+
+#### Model 2. This model will add in a random effect for individual ID and then compare model fit .
+
+```{r h1 model 2}
+# Need to switch package to glmmTMB to add a random effect
+nb_model2 <- glmmTMB(PreyCaptureEvents ~ DivePhase + offset(log(PhaseDuration)) + (1 | BirdID),
+                     family = nbinom2, data = results_long)
+
+summary(nb_model2)
+
+# Compare models
+AIC(nb_model1, nb_model2)  # Compare AIC values
+```
+
+##### Model 2 Interpretation
+
+-   **AIC**: 499,276 (model improved)
+
+#### Model 3. This model builds on Model 2 by incorporating sex.
+
+```{r model 3}
+nb_model3<- glmmTMB(PreyCaptureEvents ~ DivePhase + Sex +
+                               offset(log(PhaseDuration)) + (1 | BirdID),
+                             family = nbinom2, data = results_long)
+
+summary(nb_model3)
+AIC(nb_model2, nb_model3)  # Lower AIC is better
+```
+
+##### Model 3 Interpretation
+
+-   **AIC**: 443,002 (model improved by a lot more than Model 1 \> Model 2)
+
+#### Model 4. This model builds on Model 3 by incorporating starting mass.
+
+```{r h1 model4}
+nb_model4 <- glmmTMB(PreyCaptureEvents ~ DivePhase + Sex + StartMass +
+                               offset(log(PhaseDuration)) + (1 | BirdID),
+                             family = nbinom2, data = results_long)
+
+summary(nb_model4)
+AIC(nb_model3, nb_model4)  # Lower AIC is better
+```
+
+##### Model 4 Interpretation
+
+-   AIC: 443,001 (decreased by 1)
+
+-   There is a small negative effect of starting mass on prey capture rate, but it is non-significant (p = 0.07), so I'll be removing it from the model.
+
+### d. Evaluate residuals for best fit model
+
+Since Model 3 was our best fit, we are now going to check the residuals for this model.
+
+```{r}
+par(mfrow = c(1, 2))  # Arrange plots side by side
+plot(residuals(nb_model3), main = "Residuals", ylab = "Residuals", xlab = "Index")
+hist(residuals(nb_model3), main = "Histogram of Residuals", xlab = "Residuals")
+par(mfrow = c(1, 1))  # Reset layout
+
+plot(fitted(nb_model3), residuals(nb_model3), 
+     xlab = "Fitted Values", ylab = "Residuals", 
+     main = "Residuals vs Fitted Values")
+abline(h = 0, col = "red", lty = 2)  # Adds a reference line at 0
+```
+
+**Histogram**: Most are clustered around zero which is good. However, a couple of larger positive residuals suggests that maybe a zero-inflation model would be more appropriate.
+
+**Residuals vs. Fitted Values plot**: The residuals should be randomly scattered round zero. But these plots show a funnel kind of shape. At lower values, residuals are more tightly clustered and at higher values, the residuals become more spread out. This could suggest heteroskedasticity (variance increasing with fitted values) which can indicate overdispersion.
+
+To test for overdispersion, I am going to run a Pearson's test
+
+```{r}
+# Pearson's test for overdispersion
+overdispersion_test <- sum(residuals(nb_model3, type = "pearson")^2) / df.residual(nb_model3)
+print(overdispersion_test)
+```
+
+A value less than 1 indicates no overdispersion.
+
+We can use a pairwise comparison to check out the relationship between prey capture rates across dive phases.
+
+```{r}
+# Extract EMMs for Dive Phase and Sex
+phase_emm <- emmeans(nb_model3, ~ DivePhase, type = "response")
+sex_emm <- emmeans(nb_model3, ~ Sex, type = "response")
+
+# Convert to data frame
+phase_table <- as.data.frame(phase_emm)
+sex_table <- as.data.frame(sex_emm)
+
+# Rename columns
+colnames(phase_table) <- c("Dive Phase", "Mean Rate", "SE", "df", "Lower 95% CI", "Upper 95% CI")
+colnames(sex_table) <- c("Sex", "Mean Rate", "SE", "df", "Lower 95% CI", "Upper 95% CI")
+
+# Print results
+print("Estimated Prey Capture Rate by Dive Phase:")
+print(phase_table, row.names = FALSE)
+
+print("Estimated Prey Capture Rate by Sex:")
+print(sex_table, row.names = FALSE)
+```
+
+```{r}
+# Pairwise comparisons for Dive Phase
+phase_contrasts <- as.data.frame(pairs(phase_emm))
+
+# Pairwise comparisons for Sex
+sex_contrasts <- as.data.frame(pairs(sex_emm))
+
+# Rename columns
+colnames(phase_contrasts) <- c("Contrast", "Ratio", "SE", "df", "Null", "z-ratio", "p-value")
+colnames(sex_contrasts) <- c("Contrast", "Ratio", "SE", "df", "Null", "z-ratio", "p-value")
+
+# Print results in base R format
+print("Pairwise Comparisons for Dive Phase:")
+print(phase_contrasts, row.names = FALSE)
+
+print("Pairwise Comparisons for Sex:")
+print(sex_contrasts, row.names = FALSE)
+```
+
+##### Final model interpretation
+
+-   The destination phases has significantly higher prey capture than the ascent or descent phases, followed by the ascent phase which has the second highest.
+
+-   Male penguins have a significantly higher prey capture rate (\~26%) than female penguins, but the p-value is marginal (p = 0.38).
+
+-   There is a small influence of individual ID, but dive phase and sex are more influential.
+
+## **H2**: Pelagic dives will have a higher rate of prey capture attempts, compared to benthic dives, because benthic prey are predicted to be of a higher caloric content.
+
+First, remove animals with no GPS (22EP_308c and 22EP_310c).
+
+```{r}
+# Remove the "x" from BirdID in results_long
+results <- results %>%
+  mutate(BirdID = sub("^x", "", BirdID))  # Removes "x" at the start
+
+# Remove birds from dataset
+results_filtered <- results %>%
+  filter(!(BirdID %in% c("22EP_310c", "22EP_308c")))
+
+# Add in sex and mass
+results_filtered <- results_filtered %>%
+  left_join(morpho %>% dplyr::select(BirdID, Sex, StartMass), by = "BirdID")
+
+# Check to ensure they are removed
+unique(results_filtered$BirdID)  # Confirm removal
+```
+
+### a. Exploratory plots
+
+```{r}
+# Boxplot of prey capture by dive type
+ggplot(results_filtered, aes(x = DiveType, y = TotalEvents, fill = DiveType)) +
+  geom_boxplot(alpha = 0.7) +  
+  geom_jitter(width = 0.2, alpha = 0.3) +  # Show individual points
+  labs(title = "Prey Capture Attempts by Dive Type",
+       x = "Dive Type",
+       y = "Total Prey Capture Events") +
+  theme_minimal()
+
+# Density plot
+ggplot(results_filtered, aes(x = TotalEvents, fill = DiveType)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Distribution of Prey Capture Attempts (Filtered Birds Removed)",
+       x = "Total Prey Capture Events",
+       y = "Density") +
+  theme_minimal()
+
+summary_stats_filtered <- results_filtered %>%
+  group_by(DiveType) %>%
+  summarise(
+    MeanPreyCapture = mean(TotalEvents, na.rm = TRUE),
+    MedianPreyCapture = median(TotalEvents, na.rm = TRUE),
+    VariancePreyCapture = var(TotalEvents, na.rm = TRUE),
+    SDPreyCapture = sd(TotalEvents, na.rm = TRUE),
+    n = n()
+  )
+
+print(summary_stats_filtered)
+```
+
+The data looks good with no outliers. Let's fit the first model with only fixed effects.
+
+### b. Check data distribution
+
+```{r}
+# Histogram
+ggplot(results_filtered, aes(x = TotalEvents)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Prey Capture Attempts",
+       x = "Total Prey Capture Events",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+Since variance is also greater than the mean in these data, we will start with a negative binomial model.
+
+### c. Model fitting
+
+#### Model 5. A negative binomial model with only fixed effects and offset term to calculate prey capture rate.
+
+```{r}
+nb_model5 <- glmmTMB(TotalEvents ~ DiveType + offset(log(DiveDuration)),
+                    family = nbinom2, 
+                    data = results_filtered)
+
+summary(nb_model5)
+```
+
+##### Model 5 Interpretation
+
+-   **AIC**: 229634
+
+#### Model 6. This model will add in a random effect for individual ID and then compare model fit.
+
+```{r}
+nb_model6 <- glmmTMB(TotalEvents ~ DiveType + offset(log(DiveDuration)) + (1 | BirdID),
+                    family = nbinom2, 
+                    data = results_filtered)
+
+summary(nb_model6)
+AIC(nb_model5, nb_model6)
+```
+
+##### Model 6 Interpretation
+
+-   **AIC**: 227842 (model improved)
+
+#### Model 7. This model adds in sex.
+
+```{r}
+nb_model7 <- glmmTMB(TotalEvents ~ DiveType + offset(log(DiveDuration)) +  Sex + (1 | BirdID),
+                    family = nbinom2, 
+                    data = results_filtered)
+
+summary(nb_model7)
+AIC(nb_model6, nb_model7)
+```
+
+##### Model 7 Interpretation
+
+-   **AIC** = 197833 (model much improved)
+
+Because I suspect that sex might affect prey capture rate as an effect of dive type, I wanted to compare a model with sex as an interaction term.
+
+#### Model 8. This model adds sex as an interaction term instead.
+
+```{r}
+nb_model8 <- glmmTMB(TotalEvents ~ DiveType * Sex + offset(log(DiveDuration)) + (1 | BirdID),
+                     family = nbinom2, data = results_filtered)
+summary(nb_model8)
+AIC(nb_model7, nb_model8)
+```
+
+##### Model 8 Interpretation
+
+-   **AIC**: 197826 (model improved)
+
+-   Effect sizes and significance did not change much, but it did show that males have a slightly higher prey capture rate during epipelagic dives compared to females (p = 0.03).
+
+#### Model 9. This model adds start mass as a final random effect.
+
+```{r}
+nb_model9 <- glmmTMB(TotalEvents ~ DiveType * Sex + StartMass + offset(log(DiveDuration)) + (1 | BirdID),
+                     family = nbinom2, data = results_filtered)
+summary(nb_model9)
+AIC(nb_model8, nb_model9)
+```
+
+##### Model 9 Interpretation
+
+-   **AIC**: 197825 (marginal improvement)
+
+-   Non-significant effect of starting mass and not much model improvement, thus, I will not include it in the model.
+
+### d. Evaluate residuals for best fit model
+
+```{r}
+par(mfrow = c(1, 2)) # Arrange plots side by side
+plot(residuals(nb_model9),
+     main = "Residuals", ylab = "Residuals", xlab = "Index")
+
+hist(residuals(nb_model9),
+     main = "Histogram of Residuals",
+     xlab = "Residuals")
+
+par(mfrow = c(1, 1)) # Reset layout
+
+plot(fitted(nb_model9), residuals(nb_model9),
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+
+abline(h = 0, col = "red", lty = 2) # Adds a reference line at 0
+```
+
+**Histogram**: Histogram shows a sharp peak at 0 with a right skew.
+
+**Residuals vs. Fitted Values plot**: Downward trend may be underestimating low prey capture values and overestimating high values.
+
+I am going to check the fit of a zero-inflation model due to the high number of zeros.
+
+#### Model 10. This model tests zero-inflation.
+
+```{r}
+zinb_model1 <- glmmTMB(TotalEvents ~ DiveType * Sex + offset(log(DiveDuration)) + (1 | BirdID),
+                       ziformula = ~1,  # Zero-inflation modeled as an intercept
+                       family = nbinom2,
+                       data = results_filtered)
+
+summary(zinb_model1)
+AIC(nb_model9, zinb_model1)
+```
+
+##### Model 10 Interpretation
+
+-   **AIC**: 197126 (model improved)
+
+-   The intercept of the zero-inflation was highly significant (p \< 0.001), with a negative estimate of -1.94, meaning that some dives have no prey captures due to an additional, unaccounted for effect.
+
+### d. Evaluate residuals again
+
+```{r}
+par(mfrow = c(1, 2)) # Arrange plots side by side
+plot(residuals(zinb_model1),
+     main = "Residuals", ylab = "Residuals", xlab = "Index")
+
+hist(residuals(zinb_model1),
+     main = "Histogram of Residuals",
+     xlab = "Residuals")
+
+par(mfrow = c(1, 1)) # Reset layout
+
+plot(fitted(zinb_model1), residuals(zinb_model1),
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+
+abline(h = 0, col = "red", lty = 2) # Adds a reference line at 0
+```
+
+-   These residuals don't look that much better, so I am going to try a zero-inflation model with dive type modeled.
+
+#### Model 11. This model tests zero-inflation with dive type.
+
+```{r}
+zinb_model2 <- glmmTMB(TotalEvents ~ DiveType * Sex + offset(log(DiveDuration)) + 
+                       (1 | BirdID), 
+                       ziformula = ~DiveType, 
+                       family = nbinom2, 
+                       data = results_filtered)
+summary(zinb_model2)
+AIC(zinb_model1, zinb_model2)
+```
+
+##### Model 11 Interpretation
+
+-   **AIC**: 196014 (significant improvement)
+
+### d. Evaluate residuals for Model 11
+
+```{r}
+par(mfrow = c(1, 2)) # Arrange plots side by side
+plot(residuals(zinb_model2),
+     main = "Residuals", ylab = "Residuals", xlab = "Index")
+
+hist(residuals(zinb_model2),
+     main = "Histogram of Residuals",
+     xlab = "Residuals")
+
+par(mfrow = c(1, 1)) # Reset layout
+
+plot(fitted(zinb_model2), residuals(zinb_model2),
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+
+abline(h = 0, col = "red", lty = 2) # Adds a reference line at 0
+```
+
+#### Model 12. This model tests zero-inflation with dive type and a random slope for bird ID.
+
+```{r}
+zinb_model3 <- glmmTMB(TotalEvents ~ DiveType * Sex + offset(log(DiveDuration)) + 
+                       (1 + DiveType | BirdID), 
+                       ziformula = ~DiveType, 
+                       family = nbinom2, 
+                       data = results_filtered)
+summary(zinb_model3)
+AIC(zinb_model2, zinb_model3)
+```
+
+##### Final model interpretation
+
+-   **AIC**: This model is the best fit.
+
+-   Epipelagic dives have significantly lower prey capture rates than benthic dives.
+
+-   No difference between mesopelagic and benthic dives.
+
+-   Transit dives have significantly lower prey capture rates than benthic dives.
+
+-   No significant overall effect of sex.
+
+-   Males have significantly higher prey capture rates in epipelagic dives than females.
+
+-   Benthic dives have low excess zero probability.
+
+-   Epipelagic dives have significantly higher excess zero probability than benthic.
+
+-   Mesopelagic dives produced an unstable estimate.
+
+-   Transit have the highest excess zero probability.
+
+-   Individual birds vary significantly in prey capture across dives and within dive types.
+
+### d. Evaluate residuals for final final model
+
+```{r}
+par(mfrow = c(1, 2)) # Arrange plots side by side
+plot(residuals(zinb_model3),
+     main = "Residuals", ylab = "Residuals", xlab = "Index")
+
+hist(residuals(zinb_model3),
+     main = "Histogram of Residuals",
+     xlab = "Residuals")
+
+par(mfrow = c(1, 1)) # Reset layout
+
+plot(fitted(zinb_model3), residuals(zinb_model3),
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+
+abline(h = 0, col = "red", lty = 2) # Adds a reference line at 0
+```
+
+The residuals look the same.
+
+Evaluate model aspects.
+
+```{r}
+# Check for zero inflation correction
+check_zeroinflation(zinb_model3)
+```
+
+## **H4**: ODBA, a proxy for energy expenditure, will increase with a higher prey capture attempt rate.
+
+### a. Exploratory plots
+
+```{r}
+ggplot(results_filtered, aes(x = TotalEvents, y = ODBA_Total)) +
+  geom_point(alpha = 0.5) +  # Add scatter points
+  geom_smooth(method = "lm", color = "red", se = TRUE) +  # Add trend line
+  labs(title = "Relationship Between ODBA and Prey Capture Attempts",
+       x = "Prey Capture Attempts",
+       y = "Total ODBA (Energy Expenditure)") +
+  theme_minimal()
+
+ggplot(results_filtered, aes(x = TotalEvents, y = ODBA_Total)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~DiveType) +  # Separate plots for each dive type
+  labs(title = "ODBA vs. Prey Capture Attempts by Dive Type",
+       x = "Prey Capture Attempts",
+       y = "Total ODBA") +
+  theme_minimal()
+```
+
+```{r}
+# Run Pearson's correlation test
+cor_test <- cor.test(results_filtered$TotalEvents, results_filtered$ODBA_Total)
+cor_test
+```
+
+### b. Check data distribution
+
+```{r}
+# Histogram
+ggplot(results_filtered, aes(x = ODBA_Total)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Prey Capture Attempts",
+       x = "Total ODBA",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+### c. Model fitting
+
+Since ODBA is a continuous variable, we will fit a linear mixed-effects model (LMM).
+
+#### Model 13 - A linear model with only ODBA and events with an offset for dive duration.
+
+```{r}
+lmm_model1 <- lm(ODBA_Total ~ TotalEvents + offset(log(DiveDuration)), data = results_filtered)
+
+summary(lmm_model1)
+AIC(lmm_model1)
+```
+
+##### Model 13 Interpretation
+
+-   **AIC** = 643677
+
+#### Model 14 - A linear model with ODBA, total events, and random effect for ID.
+
+```{r}
+lmm_model2 <- lmer(ODBA_Total ~ TotalEvents + offset(log(DiveDuration)) + (1 | BirdID),
+                   data = results_filtered)
+
+# Model summary
+summary(lmm_model2)
+AIC(lmm_model1, lmm_model2)
+```
+
+##### Model 14 Interpretation
+
+-   **AIC** = 641475 (model improved)
+
+#### Model 15 - A linear model with ODBA, total events, random effect for ID, and sex.
+
+```{r}
+lmm_model3 <- lmer(ODBA_Total ~ TotalEvents + Sex + offset(log(DiveDuration)) + (1 | BirdID),
+                   data = results_filtered)
+
+# Model summary
+summary(lmm_model3)
+AIC(lmm_model2, lmm_model3)
+```
+
+##### Model 15 Interpretation
+
+-   AIC: 548049 (model significantly improved)
+
+#### Model 16 - A linear model with ODBA, total events, random effect for ID, sex, and mass.
+
+```{r}
+lmm_model4 <- lmer(ODBA_Total ~ TotalEvents + Sex + StartMass + offset(log(DiveDuration)) + (1 | BirdID),
+                   data = results_filtered)
+
+# Model summary
+summary(lmm_model4)
+AIC(lmm_model3, lmm_model4)
+```
+
+##### Model 16 Interpretation
+
+-   **AIC**: 548042 (model slightly improved)
+
+#### Model 17 - A linear model with ODBA, total events, random effect for ID, sex, mass, and dive type.
+
+```{r}
+lmm_model5 <- lmer(ODBA_Total ~ TotalEvents + Sex + DiveType + StartMass + offset(log(DiveDuration)) + (1 | BirdID),
+                   data = results_filtered)
+
+# Model summary
+summary(lmm_model5)
+AIC(lmm_model4, lmm_model5)
+```
+
+##### Model 17 Interpretation
+
+-   **AIC**: 548042 (model significantly improved)
+
+### d. Evaluate residuals for final model
+
+```{r}
+par(mfrow = c(1, 2)) # Arrange plots side by side
+plot(residuals(lmm_model5),
+     main = "Residuals", ylab = "Residuals", xlab = "Index")
+
+hist(residuals(lmm_model5),
+     main = "Histogram of Residuals",
+     xlab = "Residuals")
+
+par(mfrow = c(1, 1)) # Reset layout
+
+plot(fitted(lmm_model5), residuals(lmm_model5),
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+
+abline(h = 0, col = "red", lty = 2) # Adds a reference line at 0
+```
+
+-   **Residuals vs. Index**: There shouldn't be a pattern, but there is an obvious kind of banded line with a sharp peak around 15000.
+
+-   **Histogram of residuals**: These residuals are not perfectly distributed but look okay (I think).
+
+I am going to try adding DiveType as a random intercept, so that it allows for variability between individual birds.
+
+#### Model 18 - A linear model with ODBA, total events, random effect for ID, sex, mass, and dive type modeled as a random effect.
+
+```{r}
+lmm_model6 <- lmer(ODBA_Total ~ TotalEvents + Sex + DiveType + StartMass + 
+                    offset(log(DiveDuration)) + (1 + DiveType | BirdID),
+                    data = results_filtered, REML = TRUE)
+
+summary(lmm_model6)
+AIC(lmm_model5, lmm_model6)
+```
+
+##### Model 18 Interpretation
+
+-   AIC: 533663 (model significantly improved)
+
+```{r}
+# Check residuals
+par(mfrow = c(1, 2))
+plot(resid(lmm_model6), main = "Residuals", ylab = "Residuals", xlab = "Index")
+hist(resid(lmm_model6), main = "Histogram of Residuals", xlab = "Residuals", breaks = 50)
+
+# Residuals vs. Fitted Values
+plot(fitted(lmm_model6), resid(lmm_model6), main = "Residuals vs Fitted Values",
+     xlab = "Fitted Values", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+```
+
+### d. Evaluate residuals for final final model
+
+-   **Histogram of residuals**: This is a decent bell shape but has a slight right skew.
+
+-   **Residuals vs. fitted residuals**: The shape should be more randomized and the shape suggests heteroscedasticity may be present.

@@ -1,0 +1,936 @@
+---
+title: "DiveType"
+author: "Taylor Azizeh"
+date: "2024-12-05"
+output: html_document
+---
+
+
+
+
+
+
+Title: All thesis model fitting
+Author: Taylor Azizeh
+Description:
+
+
+
+
+
+
+
+
+``` {r packages}
+# Load packages
+library(tidyverse)
+library(influence.ME)
+library(interactions)
+library(lme4)
+library(data.table)
+library(readr)
+library(depmixS4)
+library(geosphere)  # for distance calculation
+library(sf)
+library(glmmTMB)
+library(dplyr)
+library(DHARMa)
+library(performance)
+library(car)
+library(adehabitatLT)
+library(lubridate)
+```
+
+``` {r directories}
+# Define directories
+odba_dir <- "/Users/taylorazizeh/Documents/Research/Moss Landing Marine Laboratories/Emperor penguins/Data/FINAL/ODBA"
+prey_dir <- "/Users/taylorazizeh/Documents/Research/Moss Landing Marine Laboratories/Emperor penguins/Data/FINAL/Dive phases prey capture"
+morpho_path <- "/Users/taylorazizeh/Documents/Research/Moss Landing Marine Laboratories/Emperor penguins/Data/EMPE_morphometrics.csv"
+```
+
+``` {r read in and combine data}
+# Read in morphometric data
+morpho_data <- read_csv(morpho_path)
+
+# Read in prey files
+prey_files <- list.files(prey_dir, pattern = "_prey_capture_rates\\.csv$", full.names = TRUE)
+
+# Extract BirdID from filename (first 9 chars, e.g., "22EP_313d")
+extract_id <- function(filename) substr(basename(filename), 1, 9)
+prey_ids <- map_chr(prey_files, extract_id)
+
+# Read all prey files into one data frame, labeling each row by BirdID
+combined_prey <- prey_files %>%
+  set_names(prey_ids) %>%
+  map_dfr(read_csv, .id = "BirdID")
+
+# Combine prey capture data with morphometric data
+combined_prey <- combined_prey %>%
+  left_join(morpho_data, by = c("BirdID" = "ID")) # Match BirdID in prey data to ID in morphometric data
+
+# Check the data
+head(combined_prey)
+
+# Add a Year column by extracting the first two digits of BirdID
+combined_prey <- combined_prey %>%
+  mutate(Year = as.numeric(substr(BirdID, 1, 2))) # Extract first two digits as numeric
+
+# Reshape data to ensure PreyCaptureRate corresponds to individual dive phases
+long_data_015 <- combined_prey %>%
+  select(BirdID, DiveNumber, DiveDuration, Sex, `Initial mass`, Year,
+         ToRate_015, DestinationRate_015, FromRate_015) %>%
+  pivot_longer(
+    cols = c(ToRate_015, DestinationRate_015, FromRate_015), # Only include _015 columns
+    names_to = "DivePhase",
+    values_to = "PreyCaptureRate"
+  ) %>%
+  mutate(
+    DivePhase = factor(DivePhase), # Ensure DivePhase is a factor
+    Sex = factor(Sex),             # Ensure Sex is a factor
+    Year = factor(Year)            # Treat Year as a factor for categorical analysis
+  )
+
+# Check the structure of the reshaped data
+head(long_data_015)
+```
+
+HYPOTHESIS 1: The rate of prey capture attempts will be highest in the bottom phase of the dive, where emperor penguins are believed to be primarily hunting.
+``` {r h1 exploratory plots}
+# Filter data for plotting: remove outliers where PreyCaptureRate >= 1
+plot_data <- long_data_015 %>%
+  filter(PreyCaptureRate < 1)
+
+# 1. Boxplot of PreyCaptureRate by Dive Phase
+ggplot(plot_data, aes(x = DivePhase, y = PreyCaptureRate, fill = DivePhase)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  coord_cartesian(ylim = c(0, 1)) +  # Adjust y-axis limits to focus on rates < 1
+  theme_minimal() +
+  labs(
+    title = "Prey Capture Rate by Dive Phase (Outliers < 1 Removed)",
+    x = "Dive Phase",
+    y = "Prey Capture Rate"
+  ) +
+  theme(
+    legend.position = "none"  # No legend needed for DivePhase fill
+  )
+
+# 2. Faceted Boxplot of PreyCaptureRate by BirdID and Dive Phase
+ggplot(plot_data, aes(x = BirdID, y = PreyCaptureRate, fill = DivePhase)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  facet_wrap(~ DivePhase, ncol = 3) +  # One facet per DivePhase
+  theme_minimal() +
+  labs(
+    title = "Prey Capture Rate (<1) by Bird and Dive Phase",
+    x = "Bird ID",
+    y = "Prey Capture Rate"
+  ) +
+  theme(
+    strip.text = element_text(size = 12),               # Facet label size
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate BirdID labels for readability
+    legend.position = "none",                           # No legend needed for fill
+    text = element_text(size = 12)
+  )
+
+# 3. Scatter Plot of PreyCaptureRate vs Dive Duration by Dive Phase
+ggplot(plot_data, aes(x = DiveDuration, y = PreyCaptureRate, color = DivePhase)) +
+  geom_point(alpha = 0.6, size = 1.5) +   # Scatter points
+  geom_smooth(
+    method = "loess",         # Use loess smoothing
+    formula = y ~ x,          # Default formula
+    se = FALSE,               # Suppress confidence interval
+    size = 1
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Prey Capture Rate vs Dive Duration by Dive Phase",
+    x = "Dive Duration (s)",
+    y = "Prey Capture Rate"
+  ) +
+  theme(
+    legend.title = element_text(size = 12, face = "bold"),
+    text = element_text(size = 12)
+  )
+```
+
+``` {r h1 model fitting}
+# Fit the updated GLMM with DiveNumber as a random effect
+glmm_model1 <- glmer(
+  PreyCaptureRate ~ DivePhase + Sex + `Initial mass` + DiveDuration +
+    (1 | BirdID) + (1 | Year) + (1 | DiveNumber),
+  data = long_data_015,
+  family = gaussian(link = "identity")
+)
+
+# Summarize the updated model
+summary(glmm_model1)
+
+oisSingular(glmm_model1)
+```
+
+``` {r h1 model 2}
+# Remove year and rerun
+glmm_model2 <- glmer(
+  PreyCaptureRate ~ DivePhase + Sex + `Initial mass` + DiveDuration +
+    (1 | BirdID) + (1 | DiveNumber),
+  data = long_data_015,
+  family = gaussian(link = "identity")
+)
+
+summary(glmm_model2)
+isSingular(glmm_model2)
+```
+
+``` {r evaluate residuals}
+qqnorm(resid(glmm_model2))
+qqline(resid(glmm_model2))
+
+library(emmeans)
+emmeans(glmm_model2, pairwise ~ DivePhase)
+
+plot(resid(glmm_model2) ~ fitted(glmm_model2), main = "Residuals vs Fitted")
+```
+
+``` {r extreme residuals}
+# Extract residuals and fitted values
+residuals_data <- data.frame(
+  Residuals = resid(glmm_model2),
+  Fitted = fitted(glmm_model2),
+  DiveNumber = long_data_015$DiveNumber,  # Add DiveNumber for reference
+  BirdID = long_data_015$BirdID          # Add BirdID for reference
+)
+
+# Identify extreme residuals
+extreme_residuals <- residuals_data %>%
+  filter(abs(Residuals) > quantile(abs(Residuals), 0.99))  # Top 1% residuals
+
+print(extreme_residuals)
+```
+
+``` {r clean model 2 and comparison}
+# Remove rows corresponding to extreme residuals
+clean_data <- long_data_015 %>%
+  filter(!(DiveNumber %in% extreme_residuals$DiveNumber & BirdID %in% extreme_residuals$BirdID))
+
+# Check the dimensions of the cleaned dataset
+dim(clean_data)
+
+glmm_model_clean <- glmer(
+  PreyCaptureRate ~ DivePhase + Sex + `Initial mass` + DiveDuration +
+    (1 | BirdID) + (1 | DiveNumber),
+  data = clean_data,
+  family = gaussian(link = "identity")
+)
+
+# Summarize the updated model
+summary(glmm_model_clean)
+
+# Check for singularity
+isSingular(glmm_model_clean)
+
+# Compare AIC and BIC of the two models
+AIC(glmm_model2, glmm_model_clean)
+BIC(glmm_model2, glmm_model_clean)
+```
+
+``` {r VIF}
+# Evaluate VIF
+# Extract fixed-effects formula only
+fixed_effects_formula <- as.formula(
+  paste("PreyCaptureRate ~", paste(attr(terms(glmm_model_clean), "term.labels"), collapse = " + "))
+)
+
+# Create a linear model proxy using only fixed effects
+lm_proxy <- lm(fixed_effects_formula, data = clean_data)
+
+# Calculate VIF
+vif_values <- vif(lm_proxy)
+print(vif_values)
+```
+
+``` {r check for correlation h1}
+# Check variance-covariance structure
+VarCorr(glmm_model2)
+
+# Create residuals_data with DiveDuration
+residuals_data <- data.frame(
+  Residuals = resid(glmm_model2),
+  Fitted = fitted(glmm_model2),
+  DiveDuration = long_data_015$DiveDuration  # Include DiveDuration
+)
+
+# Plot residuals
+ggplot(residuals_data, aes(x = Fitted, y = Residuals)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Residuals vs Fitted Values")
+
+# Check for autocorrelation
+acf(residuals(glmm_model2))  # Autocorrelation function
+
+# Correlation between residuals and DiveDuration
+cor(residuals_data[, c("Residuals", "DiveDuration")], method = "pearson")
+```
+
+HYPOTHESIS 2: Pelagic dives will have a higher rate of prey capture attempts, compared to benthic dives, because benthic prey are predicted to be of a higher caloric content.
+
+``` {r read in ODBA data}
+# Read in prey files
+odba_files <- list.files(odba_dir, pattern = "_ODBA_with_PreyCapture\\.csv$", full.names = TRUE)
+
+# Extract BirdID from filename (first 9 chars, e.g., "22EP_313d")
+extract_id <- function(filename) substr(basename(filename), 1, 9)
+odba_ids <- map_chr(odba_files, extract_id)
+
+# Read all prey files into one data frame, labeling each row by BirdID
+combined_odba <- odba_files %>%
+  set_names(odba_ids) %>%
+  map_dfr(read_csv, .id = "BirdID")
+
+# Combine prey capture data with morphometric data
+combined_odba <- combined_odba %>%
+  left_join(morpho_data, by = c("BirdID" = "ID")) # Match BirdID in prey data to ID in morphometric data
+
+# Check the data
+head(combined_odba)
+```
+
+``` {r h2 exploratory plots}
+# Boxplot: Prey Capture Rate by Dive Type
+ggplot(combined_odba, aes(x = Classification, y = PreyCaptureRate_015)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  coord_cartesian(ylim = c(0, 0.5)) +  # Adjust y-axis as needed
+  theme_minimal() +
+  labs(
+    title = "Prey Capture Rates by Dive Type (Raw Data)",
+    x = "Dive Type",
+    y = "Prey Capture Rate"
+  )
+
+# Scatter plot: Prey Capture Rate vs Maximum Depth
+ggplot(combined_odba, aes(x = MaxDepth, y = PreyCaptureRate_015, color = Classification)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Prey Capture Rate vs Maximum Depth by Dive Type",
+    x = "Maximum Depth (m)",
+    y = "Prey Capture Rate",
+    color = "Dive Type"
+  ) +
+  coord_cartesian(ylim = c(0, 0.5))  # Cap the y-axis
+
+# Histogram: Dive Duration by Dive Type
+ggplot(combined_odba %>% filter(Duration <= 1000), aes(x = Duration, fill = Classification)) +
+  geom_histogram(alpha = 0.7, bins = 30, position = "identity") +
+  theme_minimal() +
+  labs(
+    title = "Dive Duration Distribution by Dive Type",
+    x = "Dive Duration (s)",
+    y = "Count",
+    fill = "Dive Type"
+  )
+
+
+# Scatter plot: Spatial Distribution of Dives by Dive Type
+ggplot(combined_odba, aes(x = Longitude, y = Latitude, color = Classification)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Distribution of Dives by Dive Type",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Dive Type"
+  )
+```
+
+``` {r h2 model 3}
+# Fit the GLMM
+glmm_model3 <- glmmTMB(
+  PreyCaptureRate_015 ~ Classification * Duration + Sex + `Initial mass` + (1 | BirdID),
+  data = combined_odba,
+  family = tweedie(link = "log")
+)
+
+# Model summary
+summary(glmm_model3)
+
+# Simulate residuals for the model
+sim_residuals <- simulateResiduals(fittedModel = glmm_model3)
+
+# Plot residual diagnostics
+plot(sim_residuals)
+testZeroInflation(sim_residuals)
+testDispersion(sim_residuals)
+testUniformity(sim_residuals)
+```
+
+``` {r h2 model 4}
+# Simplified GLMM without Duration, Sex, and Initial Mass
+glmm_model4 <- glmmTMB(
+  PreyCaptureRate_015 ~ Classification + (1 | BirdID),
+  data = combined_odba,
+  family = tweedie(link = "log")
+)
+
+# Model summary
+summary(glmm_model4)
+```
+
+``` {r res and aic model 3 and 4}
+sim_res <- simulateResiduals(glmm_model3)
+plot(sim_res)
+AIC(glmm_model3, glmm_model4)
+```
+
+``` {r identify outliers}
+# Extract residuals and fitted values
+residuals <- residuals(glmm_model3, type = "pearson")
+fitted_values <- predict(glmm_model3, type = "response")
+
+# Approximate leverage (h_i)
+n <- nrow(combined_odba)  # Number of observations
+p <- length(fixef(glmm_model3)$cond)  # Number of fixed-effect parameters
+leverage <- fitted_values / sum(fitted_values)  # Approximation for h_i
+
+# Calculate Cook's Distance
+cooks_distance <- (residuals^2 * leverage) / (p * (1 - leverage)^2)
+
+# View summary of Cook's Distance
+summary(cooks_distance)
+
+# Define Cook's Distance threshold
+cooks_threshold <- 4 / n
+
+# Identify influential points
+influential_points <- which(cooks_distance > cooks_threshold)
+
+# View influential points
+length(influential_points)
+
+plot(cooks_distance, type = "h", main = "Cook's Distance for Observations",
+     ylab = "Cook's Distance", xlab = "Observation Index")
+abline(h = cooks_threshold, col = "red", lty = 2)
+```
+
+``` {r h2 model 5}
+# Remove influential points
+filtered_no_influential <- combined_odba[-influential_points, ]
+
+glmm_model5 <- glmmTMB(
+  PreyCaptureRate_015 ~ Classification + (1 | BirdID),
+  data = filtered_no_influential,
+  family = tweedie(link = "log")
+)
+
+# Summarize the new model
+summary(glmm_model5)
+
+# Compare previous model to new one
+AIC(glmm_model3, glmm_model5)
+
+# Calculate Cook's Distance for the new model
+new_residuals <- residuals(glmm_model5, type = "pearson")
+new_fitted_values <- predict(glmm_model5, type = "response")
+new_leverage <- new_fitted_values / sum(new_fitted_values)
+new_cooks_distance <- (new_residuals^2 * new_leverage) / (p * (1 - new_leverage)^2)
+
+# Plot the new Cook's Distance
+plot(new_cooks_distance, type = "h", main = "Cook's Distance (Updated)",
+     ylab = "Cook's Distance", xlab = "Observation Index")
+abline(h = cooks_threshold, col = "red", lty = 2)
+```
+
+HYPOTHESIS 3: Pelagic dives will have a higher rate of prey capture attempts, compared to benthic dives, because benthic prey are predicted to be of a higher caloric content.
+
+``` {r h3 exploratory plots}
+ggplot(combined_odba, aes(x = PreyCaptureRate_015, y = ODBA_Standardized, color = Classification)) +
+  geom_point(alpha = 0.6, size = 3) +
+  geom_smooth(method = "lm", se = TRUE, aes(group = Classification), linetype = "dashed") +
+  facet_wrap(~Classification, scales = "free") +
+  labs(
+    title = "Prey Capture Rate vs Energy Expenditure (ODBA)",
+    x = "Prey Capture Rate (0.15 Threshold)",
+    y = "Energy Expenditure (ODBA)",
+    color = "Dive Type"
+  ) +
+  theme_minimal()
+
+ggplot(combined_odba, aes(x = Classification, y = ODBA_Standardized, fill = Classification)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(color = Classification), width = 0.2, alpha = 0.5) +
+  labs(
+    title = "Energy Expenditure Across Dive Types",
+    x = "Dive Type",
+    y = "Energy Expenditure (ODBA)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(combined_odba, aes(x = Duration, y = ODBA_Standardized, color = PreyCaptureRate_015)) +
+  geom_point(alpha = 0.6, size = 3) +
+  scale_color_gradient(low = "blue", high = "red") +
+  facet_wrap(~Classification, scales = "free") +
+  labs(
+    title = "Energy Expenditure vs Dive Duration by Prey Capture Rate",
+    x = "Dive Duration (s)",
+    y = "Energy Expenditure (ODBA)",
+    color = "Prey Capture Rate 0.15"
+  ) +
+  theme_minimal()
+
+ggplot(combined_odba, aes(x = ODBA_Standardized, fill = Classification)) +
+  geom_density(alpha = 0.6) +
+  labs(
+    title = "Density of Energy Expenditure (ODBA) by Dive Type",
+    x = "Energy Expenditure (ODBA)",
+    y = "Density",
+    fill = "Dive Type"
+  ) +
+  theme_minimal()
+```
+
+``` {r reformat data}
+# Add year column
+combined_odba$Year <- substr(combined_odba$BirdID, 1, 2)
+
+# Convert to a numeric format for consistency
+combined_odba$Year <- as.numeric(combined_odba$Year)
+
+# Verify the addition
+head(combined_odba$Year)
+
+# Standardize numeric predictors
+combined_odba$Duration_scaled <- scale(combined_odba$Duration)
+combined_odba$PreyCaptureRate_scaled <- scale(combined_odba$PreyCaptureRate_015)
+
+# Ensure Year is correctly extracted from BirdID
+combined_odba <- combined_odba %>%
+  mutate(Year = as.numeric(substr(BirdID, 1, 2))) %>%
+  filter(!is.na(Year))  # Remove rows where Year could not be extracted
+
+# Identify and remove rows with non-finite values in key predictors
+cleaned_odba <- combined_odba %>%
+  filter(
+    is.finite(ODBA_Standardized),
+    is.finite(PreyCaptureRate_015),
+    is.finite(Duration),
+    is.finite(`Initial mass`)
+  )
+
+# Rescale continuous predictors to address scaling issues
+cleaned_odba <- cleaned_odba %>%
+  mutate(
+    Duration_scaled = scale(Duration),
+    PreyCaptureRate_scaled = scale(PreyCaptureRate_015),
+    Mass_scaled = scale(`Initial mass`)
+  )
+```
+
+``` {r h3 model 5}
+# Fit the model again with cleaned and scaled data
+glmer_model_cleaned <- glmer(
+  ODBA_Standardized ~ PreyCaptureRate_scaled * Classification + Duration_scaled +
+    Sex + Mass_scaled + 
+    (1 + Duration_scaled | BirdID) + (1 | Year),
+  data = cleaned_odba,
+  family = Gamma(link = "log")
+)
+
+# Summarize the model
+summary(glmer_model_cleaned)
+```
+
+``` {r remove outliers h3}
+# Remove outliers
+
+# Filter extreme values for ODBA_Standardized
+cleaned_odba <- cleaned_odba %>%
+  filter(ODBA_Standardized < quantile(ODBA_Standardized, 0.99))
+```
+
+``` {r h3 model 6}
+# Refit the model
+glmer_model6 <- glmer(
+  ODBA_Standardized ~ PreyCaptureRate_scaled * Classification + Duration_scaled +
+    Sex + Mass_scaled + 
+    (1 + Duration_scaled | BirdID) + (1 | Year),
+  data = cleaned_odba,
+  family = Gamma(link = "log")
+)
+
+summary(glmer_model6)
+```
+
+``` {r center variables and tweedie model 7}
+cleaned_odba <- cleaned_odba %>%
+  mutate(
+    PreyCaptureRate_centered = scale(PreyCaptureRate_scaled, scale = FALSE)
+  )
+
+tweedie_model <- glmmTMB(
+  ODBA_Standardized ~ PreyCaptureRate_centered * Classification +
+    Duration_scaled + Mass_scaled + Sex +
+    (1 | BirdID) + (1 | Year),
+  data = cleaned_odba,
+  family = tweedie(link = "log")
+)
+
+summary(tweedie_model)
+```
+
+``` {r model 8}
+# Remove birds with unknown sex
+cleaned_odba <- cleaned_odba %>%
+  filter(!BirdID %in% c("19EP_302c", "22EP_313c", "22EP_313d"))
+
+# Remove extreme outliers for ODBA_Standardized
+cleaned_odba <- cleaned_odba %>%
+  filter(ODBA_Standardized < quantile(ODBA_Standardized, 0.99))
+
+# Center PreyCaptureRate
+cleaned_odba <- cleaned_odba %>%
+  mutate(
+    PreyCaptureRate_centered = scale(PreyCaptureRate_scaled, scale = FALSE)
+  )
+
+# Run the Tweedie model
+tweedie_model2 <- glmmTMB(
+  ODBA_Standardized ~ PreyCaptureRate_centered * Classification +
+    Duration_scaled + Sex +
+    (1 | BirdID) + (1 | Year),
+  data = cleaned_odba,
+  family = tweedie(link = "log")
+)
+
+# Summarize the model
+summary(tweedie_model2)
+```
+
+``` {r res model8}
+simulateResiduals(tweedie_model, plot = TRUE)
+interact_plot(tweedie_model, pred = PreyCaptureRate_centered, modx = Classification)
+```
+
+Hypothesis 4: Birds will spend more time in areas associated with increased prey capture rates.
+``` {r load in gps data}
+# Load required libraries
+library(adehabitatLT)
+library(geosphere)
+library(dplyr)
+library(lubridate)
+library(sf)
+library(ggplot2)
+library(viridis)
+
+# Define folder containing penguin files
+penguin_folder <- '/Users/taylorazizeh/Documents/Research/Moss Landing Marine Laboratories/Emperor penguins/Data/FINAL/GPS'
+
+# List all CSV files in the folder
+penguin_files <- list.files(path = penguin_folder, pattern = "\\.csv$", full.names = TRUE)
+head(penguin_files)
+```
+
+``` {r run fpt}
+# Define radii for FPT analysis
+radii <- seq(10, 1000, by = 50)
+
+# Initialize an empty data frame
+combined_fpt_data <- data.frame()
+
+# Loop through each penguin file
+for (file in penguin_files) {
+  # Extract penguin ID from the file name
+  penguin_id <- tools::file_path_sans_ext(basename(file))
+  
+  cat("\nProcessing file:", penguin_id, "\n")
+  
+  # Step 1: Load and prepare data
+  penguin_data <- read.csv(file)
+  penguin_data$time <- parse_date_time(penguin_data$Timestamp, 
+                                       orders = c("mdy HMS", "mdy HM", "dmy HMS", "dmy HM", "ymd HMS", "ymd HM"))
+  penguin_data <- penguin_data[!is.na(penguin_data$time), ]  # Remove rows with NAs
+  penguin_data <- penguin_data %>%
+    distinct(ID, time, .keep_all = TRUE)
+  
+  # Step 2: Reproject coordinates to UTM (Zone 58S)
+  penguin_sf <- st_as_sf(penguin_data, coords = c("Lon", "Lat"), crs = 4326)
+  penguin_sf <- st_transform(penguin_sf, crs = 32758)
+  penguin_data$X <- st_coordinates(penguin_sf)[, 1]  # Easting
+  penguin_data$Y <- st_coordinates(penguin_sf)[, 2]  # Northing
+  
+  # Step 3: Create trajectory object
+  coords <- penguin_data[, c("X", "Y")]
+  traj <- as.ltraj(xy = coords, date = penguin_data$time, id = penguin_data$ID, typeII = TRUE)
+  
+  # Step 4: Perform FPT analysis
+  fpt_output <- fpt(traj, radii)
+  
+  # Step 5: Identify optimal radius
+  log_variances <- sapply(1:length(radii), function(i) {
+    fpt_values <- fpt_output[[1]][, paste0("r", i)]
+    if (all(is.na(fpt_values))) return(NA)
+    return(var(log(fpt_values[!is.na(fpt_values)]), na.rm = TRUE))
+  })
+  
+  best_radius_index <- which.max(log_variances)
+  best_radius <- radii[best_radius_index]
+  
+  # Extract FPT values for the best radius and convert to minutes
+  column_name <- paste0("r", best_radius_index)
+  penguin_data$FPT <- fpt_output[[1]][, column_name] / 60  # Convert seconds to minutes
+  
+  # Step 6: Calculate the 95th percentile ***** Ignore this 
+  fpt_95 <- quantile(penguin_data$FPT, 0.95, na.rm = TRUE)
+  
+  # Step 7: Filter data for 95th percentile and maximum values
+  #filtered_data <- penguin_data %>%
+    #filter(FPT >= fpt_95 | FPT == max(FPT, na.rm = TRUE))
+  
+  filtered_data <- penguin_data
+  
+  # Inside the loop
+  # Drop the "V1" column from penguin_data if it exists
+  if ("V1" %in% colnames(penguin_data)) {
+    penguin_data <- penguin_data[, !colnames(penguin_data) %in% "V1"]
+    }
+
+  # Now append to combined_fpt_data
+  combined_fpt_data <- rbind(combined_fpt_data, penguin_data)
+
+  # Step 8: Create the plot
+  p <- ggplot() +
+    geom_path(data = penguin_data, aes(x = X, y = Y), color = "grey80", size = 0.5) +
+    geom_point(
+      data = filtered_data,
+      aes(x = X, y = Y, color = FPT, size = FPT),
+      alpha = 0.8
+    ) +
+    scale_color_viridis(option = "D", na.value = "grey", name = "FPT (min)", direction = 1) +
+    scale_size_continuous(name = "FPT (min)", range = c(2, 6)) +
+    labs(
+     # title = paste("Penguin Track - Top 95th Percentile & Maximum FPT -", penguin_id),
+      x = "Easting (m)",
+      y = "Northing (m)"
+    ) +
+    theme_minimal()
+  
+  # Explicitly print the plot
+  print(p)
+}
+```
+
+``` {r format timestamp}
+# Check timestamp formats
+str(combined_fpt_data$Timestamp)
+str(combined_odba$Timestamp)
+
+# Convert combined_fpt_data$Timestamp to POSIXct
+combined_odba$Timestamp <- as.POSIXct(combined_odba$Timestamp, format = "%d-%b-%Y %H:%M:%S", tz = "UTC")
+combined_fpt_data$Timestamp <- as.POSIXct(combined_fpt_data$Timestamp, format = "%m/%d/%y %H:%M", tz = "UTC")
+
+# Check timestamp formats
+str(combined_fpt_data$Timestamp)
+str(combined_odba$Timestamp)
+```
+
+``` {r pair data}
+# Convert to data.table
+combined_odba_dt <- as.data.table(combined_odba)
+combined_fpt_data_dt <- as.data.table(combined_fpt_data)
+
+head(combined_odba_dt)
+head(combined_fpt_data_dt)
+
+# Check ranges
+gps_ranges <- combined_odba %>%
+  group_by(BirdID) %>%
+  summarize(
+    Min_Lon = min(Longitude, na.rm = TRUE),
+    Max_Lon = max(Longitude, na.rm = TRUE),
+    Min_Lat = min(Latitude, na.rm = TRUE),
+    Max_Lat = max(Latitude, na.rm = TRUE)
+  )
+
+print(gps_ranges)
+
+# Conversion from UTM Zone 58S to WGS84 (geographic coordinates)
+utm_to_geo <- function(combined_odba_dt, utm_zone) {
+  # Convert to sf object
+  sf_data <- st_as_sf(combined_odba_dt, coords = c("Longitude", "Latitude"), crs = paste0("+proj=utm +zone=", utm_zone, " +south +datum=WGS84"))
+  
+  # Transform to geographic coordinates
+  geo_data <- st_transform(sf_data, crs = 4326)
+  
+  # Extract geographic coordinates
+  coords <- st_coordinates(geo_data)
+  data$Longitude <- coords[, "X"]
+  data$Latitude <- coords[, "Y"]
+  
+  return(data)
+}
+
+# Apply to UTM data
+utm_birds <- c("22EP_309c")  # Replace with actual BirdIDs for UTM data
+utm_zone <- 58  # Replace with the correct UTM zone for your data
+
+# Perform nearest-neighbor join based on Timestamp
+setkey(combined_odba_dt, Timestamp)
+paired_data <- combined_fpt_data_dt[
+  combined_odba_dt,
+  on = .(Timestamp = Timestamp),
+  roll = "nearest"
+]
+
+head(paired_data)
+unique(paired_data$ID)
+```
+# Perform nearest-neighbor join based on Timestamp
+setkey(combined_odba_dt, Timestamp)
+paired_data <- combined_fpt_data_dt[
+  combined_odba_dt,
+  on = .(Timestamp = Timestamp),
+  roll = "nearest"
+]
+
+head(paired_data)
+unique(paired_data$ID)
+```
+
+``` {r h4 exploratory plots} 
+# Scatter plot
+ggplot(paired_data, aes(x = FPT, y = PreyCaptureRate_015)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(
+    title = "Prey Capture Rate (015) vs. FPT",
+    x = "First Passage Time (FPT, minutes)",
+    y = "Prey Capture Rate (±0.15 g)"
+  ) +
+  coord_cartesian(ylim = c(0, 0.5)) +  # Cap the y-axis at 1
+  theme_minimal()
+
+# Scatterplot for PreyCaptureRate_015 by DepthCategory
+ggplot(paired_data, aes(x = FPT, y = PreyCaptureRate_015, color = Classification)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  coord_cartesian(ylim = c(0, 0.5)) +  # Cap the y-axis at 1 
+  labs(
+    title = "Prey Capture Rate (015) vs. FPT by Depth Category",
+    x = "First Passage Time (FPT, minutes)",
+    y = "Prey Capture Rate (±0.15 g)"
+  ) +
+  theme_minimal()
+
+# Create FPT quartiles within each Classification
+filtered_data <- filtered_data %>%
+  group_by(Classification) %>%
+  mutate(FPT_Quartile = cut(
+    FPT,
+    breaks = quantile(FPT, na.rm = TRUE, probs = seq(0, 1, 0.25)),
+    include.lowest = TRUE,
+    labels = c("Q1", "Q2", "Q3", "Q4")
+  )) %>%
+  ungroup()
+
+# Boxplot for PreyCaptureRate_015 by FPT Quartiles within each Classification
+ggplot(filtered_data, aes(x = FPT_Quartile, y = PreyCaptureRate_015, fill = Classification)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +  # Remove outlier points for clarity
+  labs(
+    title = "Prey Capture Rate (015) by FPT Quartiles and Classification",
+    x = "FPT Quartile",
+    y = "Prey Capture Rate (±0.15 g)",
+    fill = "Classification"
+  ) +
+  facet_wrap(~Classification, scales = "free") +  # Separate facets for each category
+  theme_minimal()
+```
+
+``` {r}
+# Filter data
+filtered_data <- paired_data %>%
+  filter(PreyCaptureRate_015 < 0.5, !is.na(Longitude), !is.na(Latitude), !is.na(FPT)) %>%
+  mutate(ID = as.factor(ID))  # Ensure BirdID is a factor
+
+filtered_data$BirdID <- as.factor(filtered_data$ID)
+
+# Create a unique list of BirdIDs
+unique_birds <- unique(filtered_data$BirdID)
+
+# Loop through each BirdID
+for (bird in unique_birds) {
+  
+  # Filter the data for the current bird
+  single_bird_data <- filtered_data %>% filter(BirdID == bird)
+  
+  # Create the plot for the current bird
+  p <- ggplot(single_bird_data, aes(x = Longitude, y = Latitude)) +
+    geom_point(aes(size = PreyCaptureRate_015, color = FPT), alpha = 0.8) +  # Prey capture rate and FPT
+    scale_color_viridis_c(name = "FPT (minutes)", option = "viridis") +  # Color for FPT
+    scale_size_continuous(name = "Prey Capture Rate (±0.15 g)", range = c(1, 6)) +  # Size for prey capture rate
+    labs(
+      title = paste("Prey Capture Rate and FPT for", bird),
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_minimal()
+  
+  # Save the plot to a file (e.g., PNG format)
+  #ggsave(
+    #filename = paste0("Prey_Capture_FPT_", bird, ".png"),
+    #plot = p,
+    #width = 10, height = 8, dpi = 300
+  #)
+  
+  # Optionally, print the plot to the console
+  print(p)
+}
+```
+
+``` {r}
+# Unique BirdIDs
+unique_birds <- unique(paired_data$BirdID)
+
+# Loop through each BirdID
+for (bird in unique_birds) {
+  
+  # Filter the data for the current bird and arrange by timestamp
+  single_bird_data <- paired_data %>%
+    filter(ID == bird) %>%
+    arrange(time)  # Ensure sequential order by time
+  
+  # Create the plot for the current bird
+  p <- ggplot(single_bird_data, aes(x = Lon, y = Lat)) +
+    geom_path(color = "blue", size = 0.5, alpha = 0.7) +  # GPS track
+    labs(
+      title = paste("Track for", bird),
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_minimal()
+  
+  # Save the plot to a file (e.g., PNG format)
+  #ggsave(
+    #filename = paste0("Track_", bird, ".png"),
+    #plot = p,
+    #width = 10, height = 8, dpi = 300
+  #)
+  
+  # Optionally, print the plot to the console for preview
+  print(p)
+}
+
+```
+
+
+
+
+``` {r}
+# Filter out missing or invalid values for key variables
+stats_data <- paired_data %>%
+  filter(!is.na(PreyCaptureRate_015), !is.na(FPT))  # Ensure no NAs
+
+# Basic linear model
+lm_basic <- lm(PreyCaptureRate_015 ~ FPT, data = stats_data)
+
+# Summary of the model
+summary(lm_basic)
+```

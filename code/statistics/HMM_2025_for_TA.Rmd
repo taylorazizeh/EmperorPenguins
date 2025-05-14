@@ -1,0 +1,1576 @@
+---
+title: "HMM_2025_for_TA"
+author: "Parker"
+date: "2025-03-01"
+output: html_document
+---
+#Notes to Taylor:
+In these scripts, the primary goal is to merge low-frequency (every 5 minutes) penguin GPS data with high-frequency (100 Hz) dive-depth data, then downsample the dive data to 1 Hz. This allows the code to synchronize position data with concurrent dive behaviors, which are otherwise recorded on vastly different timescales. Once merged, the scripts compute step lengths (distances between successive location fixes) and turning angles (based on bearing changes) to characterize the penguins’ movement. They use momentuHMM to fit hidden Markov models (HMMs) with three states, typically labeled “Resting,” “Foraging,” and “Transit.” The user can specify parameters such as the number of states, initial parameter guesses for gamma and von Mises distributions, and model formulas. For example, initial estimates for the gamma distribution can be set at half, the mean, and 1.5 times the mean (and standard deviation) of observed steps or max depths, helping the model to converge and produce meaningful state classifications.
+
+Additionally, these scripts highlight a post-processing step where any “Resting” assignment coinciding with deep dives (e.g., depth above a threshold, such as 20 meters) is reassigned to “Foraging.” This conditional correction step acknowledges that an automated HMM may misclassify some behaviors due to the variety of movement and dive patterns. Plots of time vs. max depth and trajectory maps colored by decoded states provide quick visualization of where and when each behavior is believed to occur. The code also produces summary CSV files of states over time for each penguin, allowing further analysis or validation. Such procedures and parameter choices ensure that the results are biologically meaningful and can be fine-tuned for different species or data-collection settings.
+
+Taylor, if you have prey capture data along each penguin’s track—especially with many zeros indicating no captures—you can integrate this into your hidden Markov model as an additional data stream. MomentuHMM allows zero-inflated distributions, so you could specify a zero-inflated Poisson or negative binomial for your prey capture events. This means you’d add another observation type in the “dist” list, much like how zero-inflation is managed for dive depth. By doing so, you’ll be able to differentiate foraging states in which the penguin was actively searching (and maybe not catching prey) versus times when actual captures occurred, ultimately giving you a richer view of how foraging success aligns with the states identified by your model or at least that is the hope. I also think by including prey captures you will better define resting vs foraging than I as able to. Taylor, no cap: the future of these penguin data is all yours. You are about to slay this research, for real. Keep leveling up those models, and do buy me a glizzy when you are done—it is a vibe.
+
+#Libraries
+```{r}
+#Install
+#install.packages(c("data.table", "dplyr", "lubridate", "ggplot2", "geosphere", "readr", "beepr"))
+#install.packages("momentuHMM")
+
+#Load
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(geosphere)
+library(momentuHMM)
+library(readr)      # if you are using read_csv/write_csv
+library(beepr)      # if you want the beep()
+```
+
+
+#HMM: SA & SAM
+- Max Depth with AIC and BIC results
+This script merges each penguin’s 5-minute interpolated location data with corresponding 1 Hz dive-depth data (Taylor if your data is already combined skip this part but here is an example of merging data streams), computes step length and turning angle, then fits two different 3-state hidden Markov models (SA: step & angle; SAM: step, angle & max depth) for each penguin. It compares models by AIC/BIC, identifies the best model, decodes state sequences (e.g., “Resting,” “Foraging,” “Transit”), and saves both the model outputs (CSV summaries, state-decoded data, plots) and best-model objects (RDS) for further analysis
+```{r}
+# 0. SETUP & DIRECTORIES
+
+# Because your environment lacks logLik.momentuHMM, define it:
+logLik.momentuHMM <- function(object, ...) {
+  if(!inherits(object, "momentuHMM"))
+    stop("Need a momentuHMM object")
+  # momentuHMM typically stores negative log-likelihood in object$mod$minimum
+  -object$mod$minimum
+}
+
+# Similarly, define a BIC method for momentuHMM:
+BIC.momentuHMM <- function(object, ...) {
+  if(!inherits(object, "momentuHMM"))
+    stop("Need a momentuHMM object")
+  # Sample size
+  n <- nrow(object$data)
+  # Number of parameters (estimated)
+  k <- length(object$mod$estimate)
+  # Log-likelihood:
+  ll <- logLik.momentuHMM(object)
+  # BIC calculation:
+  -2 * ll + k * log(n)
+}
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(geosphere)
+library(readr)
+library(momentuHMM)
+library(beepr)   # For beep() at the end
+
+# Directories
+dir_fpt       <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/GPS Track At_sea only, filtered, and FPT analysis V2 March 2022"
+dir_dive      <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/Stroke Rate by Dive Depth/Data_100hz_DPhase_Dnum"
+dir_out       <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/1hz merged data"
+dir_model_out <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/HMM_Models"
+
+if(!dir.exists(dir_out)) {
+  dir.create(dir_out, recursive=TRUE)
+}
+if(!dir.exists(dir_model_out)) {
+  dir.create(dir_model_out, recursive=TRUE)
+}
+
+penguinIDs <- c(3,4,5,7,9,12,18,19)
+
+
+# 1. HELPER FUNCTIONS
+
+
+# 1A) Convert 100 Hz dive data -> 1 Hz
+reduceDiveData1Hz <- function(dive_df, time_col="Timestamp") {
+  dive_df <- dive_df %>%
+    mutate(SecondTS = floor_date(.data[[time_col]], "1 second"))
+  
+  dive_1hz <- dive_df %>%
+    group_by(SecondTS) %>%
+    summarize(
+      Depth_zoc = mean(Depth_zoc, na.rm=TRUE),
+      D_num     = n_distinct(D_num, na.rm=TRUE),
+      .groups   = "drop"
+    )
+  
+  rename(dive_1hz, Timestamp_1Hz = SecondTS)
+}
+
+# 1B) Merge FPT (5-min) + Dive (100 Hz -> 1Hz)
+mergePenguinData <- function(penID, dir_fpt, dir_dive, output_dir=NULL) {
+  fpt_file  <- file.path(dir_fpt,  paste0("Pen", penID, "_filtered_interp5min_4_FPT.csv"))
+  dive_file <- file.path(dir_dive, paste0("Pen", penID, "_V1.T.X.Y.Z.Act.D_og.Tmp.D_zoc.Dph.Dnum.T_Dm.100hz.csv"))
+  
+  if(!file.exists(fpt_file)) {
+    message("Missing FPT file for Pen", penID)
+    return(NULL)
+  }
+  if(!file.exists(dive_file)) {
+    message("Missing Dive file for Pen", penID)
+    return(NULL)
+  }
+
+  # (i) Read FPT
+  data1 <- fread(fpt_file) %>%
+    mutate(
+      time = ymd_hms(time, quiet=TRUE),
+      Lon  = as.numeric(Lon),
+      Lat  = as.numeric(Lat)
+    )
+  if(nrow(data1)<1) {
+    message("No rows in FPT for Pen", penID)
+    return(NULL)
+  }
+  
+  start_time <- min(data1$time, na.rm=TRUE)
+  end_time   <- max(data1$time, na.rm=TRUE)
+  
+  # (ii) Read & filter 100 Hz
+  data2_100hz <- fread(dive_file, select=c("Timestamp","Depth_zoc (m)","D_num"),
+                       check.names=TRUE) %>%
+    rename(Depth_zoc="Depth_zoc..m.") %>%
+    mutate(
+      Timestamp = parse_date_time(Timestamp, orders=c("mdy HMS","mdy HMS OS"), exact=FALSE),
+      Depth_zoc = as.numeric(Depth_zoc),
+      D_num     = as.integer(D_num)
+    ) %>%
+    filter(!is.na(Timestamp), Timestamp>=start_time, Timestamp<=end_time)
+
+  if(nrow(data2_100hz)<1) {
+    message("No 100Hz data in time range for Pen", penID)
+    return(NULL)
+  }
+
+  # (iii) Downsample to 1 Hz
+  data2_1hz <- reduceDiveData1Hz(data2_100hz, time_col="Timestamp")
+
+  # (iv) Map each 1Hz row to the nearest 5-min row in data1
+  binIndex <- findInterval(data2_1hz$Timestamp_1Hz, data1$time, left.open=TRUE)
+  data2_1hz <- data2_1hz %>%
+    mutate(bin=binIndex) %>%
+    filter(bin>0 & bin<=nrow(data1))
+
+  if(nrow(data2_1hz)<1) {
+    message("No 1Hz data matched to bins for Pen", penID)
+    return(NULL)
+  }
+  
+  # (v) Aggregate
+  data2_agg <- data2_1hz %>%
+    group_by(bin) %>%
+    summarize(
+      Max_Depth_zoc  = max(Depth_zoc, na.rm=TRUE),
+      Mean_Depth_zoc = mean(Depth_zoc, na.rm=TRUE),
+      Dive_Variance  = var(D_num, na.rm=TRUE),
+      Dive_Num       = sum(D_num, na.rm=TRUE),
+      .groups="drop"
+    )
+  
+  merged_df <- data1 %>%
+    mutate(bin=row_number()) %>%
+    left_join(data2_agg, by="bin") %>%
+    select(-bin) %>%
+    filter(!is.na(Lon), !is.na(Lat), !is.na(time))
+
+  merged_df$ID <- paste0("Pen", penID)
+  
+  # Optionally save
+  if(!is.null(output_dir) && nrow(merged_df)>0) {
+    outFile <- file.path(output_dir, paste0("Pen", penID, "_merged_1Hz.csv"))
+    fwrite(merged_df, outFile)
+    message("Wrote merged 1Hz file for Penguin ", penID, ": ", outFile)
+  }
+
+  merged_df
+}
+
+# 1C) Compute step & angle => userStep/userAngle
+computeStepAngleNoReserved <- function(df) {
+  if(nrow(df)<3) stop("Not enough rows to compute step/angle.")
+  
+  df <- df %>% arrange(time)
+  sdist <- rep(NA, nrow(df))
+  angl  <- rep(NA, nrow(df))
+  
+  for(i in 2:nrow(df)) {
+    sdist[i] <- distVincentySphere(
+      cbind(df$Lon[i-1], df$Lat[i-1]),
+      cbind(df$Lon[i],   df$Lat[i])
+    )
+  }
+  for(i in 3:nrow(df)) {
+    b1 <- bearing(cbind(df$Lon[i-2], df$Lat[i-2]),
+                  cbind(df$Lon[i-1], df$Lat[i-1]))
+    b2 <- bearing(cbind(df$Lon[i-1], df$Lat[i-1]),
+                  cbind(df$Lon[i],   df$Lat[i]))
+    ddeg <- b2 - b1
+    drad <- ddeg*pi/180
+    drad <- (drad + pi) %% (2*pi) - pi
+    angl[i] <- drad
+  }
+  
+  # store as userStep, userAngle
+  df$userStep  <- sdist/1000  # m->km
+  df$userAngle <- angl
+  df
+}
+
+
+# 2. FITTING SA & SAM. CUSTOM STATE NAMES
+
+
+# We'll define custom state names = c("Resting","Foraging","Transit")
+
+# 2A) Fit SA
+fitModel_SA <- function(hmm_data) {
+  nbStates <- 3
+
+  dist_list <- list(step="gamma", angle="vm")
+
+  step_mean <- mean(hmm_data$step, na.rm=TRUE)
+  step_sd   <- sd(hmm_data$step,  na.rm=TRUE)
+  stepPar0  <- c(step_mean*0.5, step_mean, step_mean*1.5,
+                 step_sd*0.5,   step_sd,   step_sd*1.5)
+
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+
+  Par0 <- list(step=stepPar0, angle=anglePar0)
+
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data         = hmm_data,
+      nbStates     = nbStates,
+      dist         = dist_list,
+      Par0         = Par0,
+      stateNames   = c("Resting","Foraging","Transit"),
+      estAngleMean = list(angle=TRUE),
+      formula      = ~1
+    )
+  }, error=function(e){
+    message("Error in fitModel_SA: ", e$message)
+    NULL
+  })
+
+  fit
+}
+
+# 2B) Fit SAM (step+angle+maxDepth w/ zero-inflation).
+fitModel_SAM <- function(hmm_data) {
+  nbStates <- 3
+
+  # skip if no variation in maxDepth
+  if(sd(hmm_data$maxDepth, na.rm=TRUE)==0) {
+    message("No variation in maxDepth => skip SAM.")
+    return(NULL)
+  }
+
+  dist_list <- list(step="gamma", angle="vm", maxDepth="gamma")
+
+  step_mean <- mean(hmm_data$step, na.rm=TRUE)
+  step_sd   <- sd(hmm_data$step,  na.rm=TRUE)
+  stepPar0  <- c(step_mean*0.5, step_mean, step_mean*1.5,
+                 step_sd*0.5,   step_sd,   step_sd*1.5)
+
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+
+  md_mean <- mean(hmm_data$maxDepth, na.rm=TRUE)
+  md_sd   <- sd(hmm_data$maxDepth,  na.rm=TRUE)
+  # 9 init params for gamma + zero-inflation
+  maxDepthPar0 <- c(
+    md_mean*0.5, md_mean, md_mean*1.5,
+    md_sd*0.5,   md_sd,   md_sd*1.5,
+    0.01, 0.01,  0.01
+  )
+
+  Par0 <- list(
+    step     = stepPar0,
+    angle    = anglePar0,
+    maxDepth = maxDepthPar0
+  )
+
+  DM_list <- list(
+    maxDepth = list(
+      mean     = ~1,
+      sd       = ~1,
+      zeromass = ~1
+    )
+  )
+
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data       = hmm_data,
+      nbStates   = nbStates,
+      dist       = dist_list,
+      Par0       = Par0,
+      DM         = DM_list,
+      stateNames = c("Resting","Foraging","Transit"),
+      estAngleMean = list(angle=TRUE),
+      formula    = ~1
+    )
+  }, error=function(e){
+    message("Error in fitModel_SAM: ", e$message)
+    NULL
+  })
+
+  fit
+}
+
+# 2C) Prepare & fit
+prepAndFitHMM <- function(df) {
+  df_for_hmm <- df %>%
+    rename(Lon_ = Lon, Lat_ = Lat) %>%
+    select(ID, time, Lon_, Lat_, userStep, userAngle, Max_Depth_zoc)
+
+  baseObj <- momentuHMM:::prepData.default(
+    data       = df_for_hmm,
+    coordNames = c("Lon_","Lat_"),
+    type       = "LL"
+  )
+
+  baseObj$step     <- df_for_hmm$userStep
+  baseObj$angle    <- df_for_hmm$userAngle
+  baseObj$maxDepth <- df_for_hmm$Max_Depth_zoc
+
+  # remove rows with NA in step/angle
+  baseObj <- baseObj %>%
+    filter(!is.na(step), !is.na(angle))
+
+  if(nrow(baseObj)<3) {
+    return(list(SA=NULL, SAM=NULL, hmmData=baseObj))
+  }
+
+  fitSA  <- fitModel_SA(baseObj)
+  fitSAM <- fitModel_SAM(baseObj)
+
+  list(SA=fitSA, SAM=fitSAM, hmmData=baseObj)
+}
+
+
+# 3. MASTER LOOP - PRINT SA + SAM, CHOOSE BEST, PLOT BOTH
+
+
+# (A) We'll keep the existing summary of "best" models:
+bestModels   <- list()
+summaryTable <- data.frame(
+  ID         = character(),
+  Best_Model = character(),
+  AIC        = numeric(),
+  BIC        = numeric(),
+  stringsAsFactors=FALSE
+)
+
+# (B) NEW: Summaries for ALL SA & SAM models:
+summaryAllModels <- data.frame(
+  ID    = character(),
+  Model = character(),
+  AIC   = numeric(),
+  BIC   = numeric(),
+  stringsAsFactors=FALSE
+)
+
+for(penID in penguinIDs) {
+  cat("\n============================================\n")
+  cat("PROCESSING PENGUIN:", penID, "\n")
+  cat("============================================\n")
+
+  merged_df <- mergePenguinData(
+    penID,
+    dir_fpt,
+    dir_dive,
+    output_dir = dir_out
+  )
+  if(is.null(merged_df) || nrow(merged_df)<3) {
+    message("Skipping Pen", penID, ": not enough merged data.")
+    next
+  }
+
+  # compute step/angle => userStep/userAngle
+  df_with_steps <- tryCatch({
+    computeStepAngleNoReserved(merged_df)
+  }, error=function(e){
+    message("Pen", penID, " stepAngle error: ", e$message)
+    NULL
+  })
+  if(is.null(df_with_steps) || nrow(df_with_steps)<3) {
+    message("Skipping Pen", penID, ": step/angle not computed.")
+    next
+  }
+
+  # if needed, define Max_Depth_zoc
+  if(!"Max_Depth_zoc" %in% names(df_with_steps)) {
+    df_with_steps$Max_Depth_zoc <- NA_real_
+  }
+
+  # 3A) Fit SA & SAM
+  fit_list <- prepAndFitHMM(df_with_steps)
+  fitSA  <- fit_list$SA
+  fitSAM <- fit_list$SAM
+
+  # store them in a small list
+  fittedModels <- list()
+  if(!is.null(fitSA)  && inherits(fitSA,  "momentuHMM")) fittedModels[["SA"]]  <- fitSA
+  if(!is.null(fitSAM) && inherits(fitSAM, "momentuHMM")) fittedModels[["SAM"]] <- fitSAM
+
+  if(length(fittedModels)==0) {
+    message("No valid model for Pen", penID, "; skipping summary.")
+    next
+  }
+
+  # 3B) Print SA and SAM to console
+  cat("\n--- SA Model (Penguin", penID, ") ---\n")
+  if(!is.null(fitSA)) {
+    print(fitSA)  # summary of SA
+  } else {
+    cat("   SA not fitted or invalid.\n")
+  }
+
+  cat("\n--- SAM Model (Penguin", penID, ") ---\n")
+  if(!is.null(fitSAM)) {
+    print(fitSAM) # summary of SAM
+  } else {
+    cat("   SAM not fitted or invalid.\n")
+  }
+
+  # 3C) Compare by AIC & BIC
+  modelNames <- names(fittedModels)
+  modelAICs  <- sapply(fittedModels, function(m) {
+    val <- tryCatch(AIC(m), error=function(e) NA_real_)
+    if(length(val)==0) val <- NA_real_
+    val
+  })
+  modelBICs  <- sapply(fittedModels, function(m) {
+    val <- tryCatch(BIC(m), error=function(e) NA_real_)
+    if(length(val)==0) val <- NA_real_
+    val
+  })
+
+  cat("\nAICs for Penguin", penID, ":\n")
+  print(modelAICs)
+  cat("\nBICs for Penguin", penID, ":\n")
+  print(modelBICs)
+
+  # (i) Append BOTH SA and SAM to summaryAllModels
+  for(mName in modelNames) {
+    thisModel <- fittedModels[[mName]]
+    if(!is.null(thisModel)) {
+      thisAIC <- tryCatch(AIC(thisModel), error=function(e) NA_real_)
+      thisBIC <- tryCatch(BIC(thisModel), error=function(e) NA_real_)
+      
+      summaryAllModels <- rbind(
+        summaryAllModels,
+        data.frame(
+          ID    = paste0("Pen", penID),
+          Model = mName,
+          AIC   = thisAIC,
+          BIC   = thisBIC,
+          stringsAsFactors=FALSE
+        )
+      )
+    }
+  }
+
+  # (ii) Pick "best" by AIC
+  if(all(is.na(modelAICs))) {
+    message("All model AICs are NA => skipping pen ", penID)
+    next
+  }
+  bestIndex <- which.min(modelAICs)
+  if(length(bestIndex)==0) {
+    message("No min AIC => skipping pen ", penID)
+    next
+  }
+
+  bestModelType <- modelNames[bestIndex]
+  bestAIC       <- modelAICs[bestIndex]
+  bestBIC       <- modelBICs[bestIndex]
+
+  cat("\nChosen best model by AIC:", bestModelType, 
+      "(Penguin", penID, ") AIC =", bestAIC, 
+      "| BIC =", bestBIC, "\n")
+
+  bestModelObj <- fittedModels[[bestModelType]]
+
+  # 3D) Append best model info to summaryTable
+  summaryTable <- rbind(
+    summaryTable,
+    data.frame(
+      ID         = paste0("Pen", penID),
+      Best_Model = bestModelType,
+      AIC        = bestAIC,
+      BIC        = bestBIC,
+      stringsAsFactors=FALSE
+    )
+  )
+  bestModels[[paste0("Pen", penID)]] <- bestModelObj
+
+  # 3E) DECODE & PLOT BOTH MODELS if they exist
+  baseObj <- fit_list$hmmData
+
+  # If SA is valid, decode & plot it
+  if(!is.null(fitSA)) {
+    cat("\nGenerating plots for SA...\n")
+    v_states_SA <- viterbi(fitSA)
+    df_usedByModel_SA <- baseObj
+    df_usedByModel_SA$DecodedState <- v_states_SA
+
+    # Save CSV
+    sa_csv <- file.path(dir_model_out, paste0("Pen", penID, "_DecodedStates_SA.csv"))
+    data.table::fwrite(df_usedByModel_SA, sa_csv)
+    cat("Decoded states (SA) saved:", sa_csv, "\n")
+
+    # Plot time vs maxDepth
+    p_time_SA <- ggplot(df_usedByModel_SA, aes(x=time, y=maxDepth, color=factor(DecodedState))) +
+      geom_line() +
+      geom_point(size=1.2) +
+      labs(
+        title=paste("Pen", penID, "SA - Time vs. maxDepth"),
+        x="Time", y="maxDepth (m)", color="State"
+      ) +
+      theme_minimal()
+
+    outTimePlot_SA <- file.path(dir_model_out, paste0("Pen", penID, "_TimeDepthPlot_SA.png"))
+    ggsave(outTimePlot_SA, p_time_SA, width=8, height=5)
+    cat("Time-depth plot (SA) saved:", outTimePlot_SA, "\n")
+
+    # Plot trajectory (SA)
+    p_traj_SA <- ggplot(df_usedByModel_SA, aes(x=x, y=y, color=factor(DecodedState))) +
+      geom_point() +
+      labs(
+        title=paste("Pen", penID, "SA - Trajectory"),
+        x="Longitude", y="Latitude", color="State"
+      ) +
+      scale_color_manual(
+        values=c("1"="lightblue","2"="darkblue","3"="grey"),
+        labels=c("1"="Resting","2"="Foraging","3"="Transit")
+      ) +
+      theme_minimal()
+
+    outTrajPlot_SA <- file.path(dir_model_out, paste0("Pen", penID, "_TrajectoryPlot_SA.png"))
+    ggsave(outTrajPlot_SA, p_traj_SA, width=7, height=5)
+    cat("Trajectory plot (SA) saved:", outTrajPlot_SA, "\n")
+  }
+
+  # If SAM is valid, decode & plot it
+  if(!is.null(fitSAM)) {
+    cat("\nGenerating plots for SAM...\n")
+    v_states_SAM <- viterbi(fitSAM)
+    df_usedByModel_SAM <- baseObj
+    df_usedByModel_SAM$DecodedState <- v_states_SAM
+
+    # Save CSV
+    sam_csv <- file.path(dir_model_out, paste0("Pen", penID, "_DecodedStates_SAM.csv"))
+    data.table::fwrite(df_usedByModel_SAM, sam_csv)
+    cat("Decoded states (SAM) saved:", sam_csv, "\n")
+
+    # Plot time vs maxDepth
+    p_time_SAM <- ggplot(df_usedByModel_SAM, aes(x=time, y=maxDepth, color=factor(DecodedState))) +
+      geom_line() +
+      geom_point(size=1.2) +
+      labs(
+        title=paste("Pen", penID, "SAM - Time vs. maxDepth"),
+        x="Time", y="maxDepth (m)", color="State"
+      ) +
+      theme_minimal()
+
+    outTimePlot_SAM <- file.path(dir_model_out, paste0("Pen", penID, "_TimeDepthPlot_SAM.png"))
+    ggsave(outTimePlot_SAM, p_time_SAM, width=8, height=5)
+    cat("Time-depth plot (SAM) saved:", outTimePlot_SAM, "\n")
+
+    # Plot trajectory (SAM)
+    p_traj_SAM <- ggplot(df_usedByModel_SAM, aes(x=x, y=y, color=factor(DecodedState))) +
+      geom_point() +
+      labs(
+        title=paste("Pen", penID, "SAM - Trajectory"),
+        x="Longitude", y="Latitude", color="State"
+      ) +
+      scale_color_manual(
+        values=c("1"="lightblue","2"="darkblue","3"="grey"),
+        labels=c("1"="Resting","2"="Foraging","3"="Transit")
+      ) +
+      theme_minimal()
+
+    outTrajPlot_SAM <- file.path(dir_model_out, paste0("Pen", penID, "_TrajectoryPlot_SAM.png"))
+    ggsave(outTrajPlot_SAM, p_traj_SAM, width=7, height=5)
+    cat("Trajectory plot (SAM) saved:", outTrajPlot_SAM, "\n")
+  }
+}
+
+
+# 4. SAVE SUMMARY & BEST MODELS
+
+
+# (A) Best model for each penguin
+summary_csv <- file.path(dir_model_out, "Best_HMM_Models_Per_Penguin.csv")
+readr::write_csv(summaryTable, summary_csv)
+cat("\n*** Best-model summary saved to:", summary_csv, "\n")
+
+# (B) All SA & SAM results
+allModels_csv <- file.path(dir_model_out, "All_HMM_Models_SA_and_SAM.csv")
+readr::write_csv(summaryAllModels, allModels_csv)
+cat("\n*** All SA & SAM models (AIC/BIC) saved to:", allModels_csv, "\n")
+
+models_rds <- file.path(dir_model_out, "Best_HMM_Models_SA_vs_SAM.rds")
+saveRDS(bestModels, models_rds)
+cat("*** Best HMM models saved to:", models_rds, "\n")
+
+# Make a sound at the end:
+beepr::beep()
+
+```
+
+#HMM: SA Correction
+-SA is run but state is conditionally corrected when model output indicates resting when dives occur.
+-Condition will correct resting behavior dives to foraging  
+
+This script loads and merges 5-minute interpolated location data with corresponding 1 Hz dive data, then fits a 3-state HMM (using step length and turning angle) to classify penguin behavior into Resting, Foraging, and Transit. After decoding states via Viterbi, it conditionally reassigns any “Resting” observations that occur during deep dives (above a user-defined threshold) to “Foraging,” correcting instances where the model’s initial classification might underestimate foraging behavior. Finally, the script plots time-series depth and geographic trajectories colored by these post-processed states, and saves the combined, updated results to a CSV. Basically in instances where resting behavior had dives in it I said no, no go touch some grass. Essentially just made interpreting each state a bit easier to describe since HMM outputs are not perfect.You may not need to do this.
+```{r}
+
+# 1) SETUP & LIBRARIES
+
+# If necessary, install required packages:
+# install.packages(c("ggplot2", "data.table", "dplyr", "lubridate", "momentuHMM", "geosphere"))
+
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(momentuHMM)
+library(geosphere)   # Provides distVincentySphere
+
+# (Optional) Set bitmap type for macOS if needed:
+options(bitmapType = "cairo")
+
+
+# 2) DIRECTORIES (adjust these paths as necessary)
+
+dir_fpt       <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/GPS Track At_sea only, filtered, and FPT analysis V2 March 2022"
+dir_dive      <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/Stroke Rate by Dive Depth/Data_100hz_DPhase_Dnum"
+dir_out       <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/1hz merged data"
+dir_model_out <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/HMM_Models"
+
+# Create directories if they don't exist:
+if (!dir.exists(dir_out)) { dir.create(dir_out, recursive = TRUE) }
+if (!dir.exists(dir_model_out)) { dir.create(dir_model_out, recursive = TRUE) }
+
+# Define penguin IDs to process:
+penguinIDs <- c(3, 4, 5, 7, 9, 12, 18, 19)
+
+
+# 3) HELPER FUNCTIONS
+
+
+# 3A) Function to reduce 100 Hz dive data to 1 Hz by aggregating per second:
+reduceDiveData1Hz <- function(dive_df, time_col = "Timestamp") {
+  dive_df <- dive_df %>% mutate(SecondTS = floor_date(.data[[time_col]], "1 second"))
+  dive_1hz <- dive_df %>% group_by(SecondTS) %>% 
+    summarize(
+      Depth_zoc = mean(Depth_zoc, na.rm = TRUE),
+      D_num     = n_distinct(D_num, na.rm = TRUE),
+      .groups   = "drop"
+    )
+  rename(dive_1hz, Timestamp_1Hz = SecondTS)
+}
+
+# 3B) Merge FPT (5-min) data with dive (100 Hz -> 1 Hz) data for a given penguin:
+mergePenguinData <- function(penID, dir_fpt, dir_dive, output_dir = NULL) {
+  fpt_file  <- file.path(dir_fpt, paste0("Pen", penID, "_filtered_interp5min_4_FPT.csv"))
+  dive_file <- file.path(dir_dive, paste0("Pen", penID, "_V1.T.X.Y.Z.Act.D_og.Tmp.D_zoc.Dph.Dnum.T_Dm.100hz.csv"))
+  
+  if (!file.exists(fpt_file)) {
+    message("Missing FPT file for Pen", penID)
+    return(NULL)
+  }
+  if (!file.exists(dive_file)) {
+    message("Missing Dive file for Pen", penID)
+    return(NULL)
+  }
+  
+  # (i) Read FPT data:
+  data1 <- fread(fpt_file) %>% 
+    mutate(
+      time = ymd_hms(time, quiet = TRUE),
+      Lon  = as.numeric(Lon),
+      Lat  = as.numeric(Lat)
+    )
+  if (nrow(data1) < 1) {
+    message("No rows in FPT for Pen", penID)
+    return(NULL)
+  }
+  
+  start_time <- min(data1$time, na.rm = TRUE)
+  end_time   <- max(data1$time, na.rm = TRUE)
+  
+  # (ii) Read and filter dive data (100 Hz):
+  data2_100hz <- fread(dive_file, select = c("Timestamp", "Depth_zoc (m)", "D_num"), check.names = TRUE) %>% 
+    rename(Depth_zoc = "Depth_zoc..m.") %>% 
+    mutate(
+      Timestamp = parse_date_time(Timestamp, orders = c("mdy HMS", "mdy HMS OS"), exact = FALSE),
+      Depth_zoc = as.numeric(Depth_zoc),
+      D_num     = as.integer(D_num)
+    ) %>% 
+    filter(!is.na(Timestamp), Timestamp >= start_time, Timestamp <= end_time)
+  
+  if (nrow(data2_100hz) < 1) {
+    message("No 100Hz data in time range for Pen", penID)
+    return(NULL)
+  }
+  
+  # (iii) Downsample dive data to 1 Hz:
+  data2_1hz <- reduceDiveData1Hz(data2_100hz, time_col = "Timestamp")
+  
+  # (iv) Map each 1Hz dive record to the nearest 5-min FPT record:
+  binIndex <- findInterval(data2_1hz$Timestamp_1Hz, data1$time, left.open = TRUE)
+  data2_1hz <- data2_1hz %>% mutate(bin = binIndex) %>% filter(bin > 0 & bin <= nrow(data1))
+  
+  if (nrow(data2_1hz) < 1) {
+    message("No 1Hz data matched to bins for Pen", penID)
+    return(NULL)
+  }
+  
+  # (v) Aggregate dive data for each bin:
+  data2_agg <- data2_1hz %>% group_by(bin) %>% 
+    summarize(
+      Max_Depth_zoc  = max(Depth_zoc, na.rm = TRUE),
+      Mean_Depth_zoc = mean(Depth_zoc, na.rm = TRUE),
+      Dive_Variance  = var(D_num, na.rm = TRUE),
+      Dive_Num       = sum(D_num, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  merged_df <- data1 %>% mutate(bin = row_number()) %>% 
+    left_join(data2_agg, by = "bin") %>% select(-bin) %>% 
+    filter(!is.na(Lon), !is.na(Lat), !is.na(time))
+  
+  merged_df$ID <- paste0("Pen", penID)
+  
+  # Optionally save the merged file (if output_dir is provided):
+  if (!is.null(output_dir) && nrow(merged_df) > 0) {
+    outFile <- file.path(output_dir, paste0("Pen", penID, "_merged_1Hz.csv"))
+    fwrite(merged_df, outFile)
+    message("Wrote merged 1Hz file for Penguin ", penID, ": ", outFile)
+  }
+  
+  merged_df
+}
+
+# 3C) Compute step lengths and turning angles:
+computeStepAngleNoReserved <- function(df) {
+  if (nrow(df) < 3) stop("Not enough rows to compute step/angle.")
+  
+  df <- df %>% arrange(time)
+  sdist <- rep(NA, nrow(df))
+  angl  <- rep(NA, nrow(df))
+  
+  for (i in 2:nrow(df)) {
+    sdist[i] <- distVincentySphere(
+      cbind(df$Lon[i-1], df$Lat[i-1]),
+      cbind(df$Lon[i],   df$Lat[i])
+    )
+  }
+  for (i in 3:nrow(df)) {
+    b1 <- bearing(cbind(df$Lon[i-2], df$Lat[i-2]),
+                  cbind(df$Lon[i-1], df$Lat[i-1]))
+    b2 <- bearing(cbind(df$Lon[i-1], df$Lat[i-1]),
+                  cbind(df$Lon[i],   df$Lat[i]))
+    ddeg <- b2 - b1
+    drad <- ddeg * pi / 180
+    drad <- (drad + pi) %% (2*pi) - pi
+    angl[i] <- drad
+  }
+  
+  # Store computed step lengths (in km) and turning angles in the data frame:
+  df$userStep  <- sdist / 1000
+  df$userAngle <- angl
+  df
+}
+
+# 3D) Fit the SA model (basic model using only step and angle)
+fitModel_SA <- function(hmm_data) {
+  nbStates <- 3
+  dist_list <- list(step = "gamma", angle = "vm")
+  
+  step_mean <- mean(hmm_data$step, na.rm = TRUE)
+  step_sd   <- sd(hmm_data$step, na.rm = TRUE)
+  stepPar0  <- c(step_mean * 0.5, step_mean, step_mean * 1.5,
+                 step_sd   * 0.5, step_sd,   step_sd   * 1.5)
+  
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+  
+  Par0 <- list(step = stepPar0, angle = anglePar0)
+  
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data         = hmm_data,
+      nbStates     = nbStates,
+      dist         = dist_list,
+      Par0         = Par0,
+      stateNames   = c("Resting", "Foraging", "Transit"),
+      estAngleMean = list(angle = TRUE),
+      formula      = ~1
+    )
+  }, error = function(e) {
+    message("Error in fitModel_SA: ", e$message)
+    NULL
+  })
+  
+  fit
+}
+
+# 3E) Prepare the data for HMM and fit the SA model only:
+prepAndFitHMM <- function(df) {
+  df_for_hmm <- df %>% 
+    rename(Lon_ = Lon, Lat_ = Lat) %>% 
+    select(ID, time, Lon_, Lat_, userStep, userAngle, Max_Depth_zoc)
+  
+  baseObj <- momentuHMM:::prepData.default(
+    data       = df_for_hmm,
+    coordNames = c("Lon_", "Lat_"),
+    type       = "LL"
+  )
+  
+  baseObj$step     <- df_for_hmm$userStep
+  baseObj$angle    <- df_for_hmm$userAngle
+  baseObj$maxDepth <- df_for_hmm$Max_Depth_zoc
+  
+  # Remove rows with NA in step/angle:
+  baseObj <- baseObj %>% filter(!is.na(step), !is.na(angle))
+  
+  if (nrow(baseObj) < 3) {
+    return(list(SA = NULL, hmmData = baseObj))
+  }
+  
+  fitSA <- fitModel_SA(baseObj)
+  
+  list(SA = fitSA, hmmData = baseObj)
+}
+
+
+# 4) POST-PROCESSING FUNCTION TO RECATEGORIZE DEEP DIVES
+
+# This function changes observations from "Resting" (state 1) to "Foraging" (state 2)
+# if the max dive depth exceeds a specified threshold.
+reassignDeepDives <- function(hmm_data, decoded_states, dive_threshold = 20) {
+  # Assume: state 1 = Resting, state 2 = Foraging, state 3 = Transit.
+  # If max dive depth is above dive_threshold and the state is "Resting" (1),
+  # then reassign that observation to state 2 ("Foraging").
+  new_states <- decoded_states
+  idx <- which(hmm_data$maxDepth > dive_threshold & decoded_states == 1)
+  if (length(idx) > 0) {
+    new_states[idx] <- 2
+  }
+  new_states
+}
+
+
+# 5) MAIN LOOP: Run the SA Model, Post-Process States, Plot, and Save Results
+
+# Create an empty list to collect results for all penguins:
+all_results <- list()
+
+for (penID in penguinIDs) {
+  cat("\n============================================\n")
+  cat("Processing Penguin:", penID, "\n")
+  cat("============================================\n")
+  
+  # 1. Merge the FPT and dive data for the penguin:
+  merged_df <- mergePenguinData(penID, dir_fpt, dir_dive)
+  if (is.null(merged_df) || nrow(merged_df) < 3) {
+    cat("Skipping Penguin", penID, ": not enough merged data\n")
+    next
+  }
+  
+  # 2. Compute step lengths and turning angles:
+  df_with_steps <- tryCatch({
+    computeStepAngleNoReserved(merged_df)
+  }, error = function(e) {
+    message("Error computing step/angle for Penguin ", penID, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(df_with_steps) || nrow(df_with_steps) < 3) {
+    cat("Skipping Penguin", penID, ": step/angle not computed\n")
+    next
+  }
+  
+  # Ensure there is a max dive depth column (named "Max_Depth_zoc")
+  if (!"Max_Depth_zoc" %in% names(df_with_steps)) {
+    df_with_steps$Max_Depth_zoc <- NA_real_
+  }
+  
+  # 3. Prepare the data for HMM and fit the SA model:
+  fit_list <- prepAndFitHMM(df_with_steps)
+  fitSA <- fit_list$SA  # The SA model
+  baseObj <- fit_list$hmmData
+  
+  if (is.null(fitSA)) {
+    cat("SA model not fitted for Penguin", penID, "\n")
+    next
+  }
+  
+  # 4. Decode the states using Viterbi from the SA model:
+  decoded_states <- viterbi(fitSA)
+  
+  # 5. Post-process: reassign deep dives (where maxDepth > threshold) that were marked as Resting (state 1)
+  dive_threshold <- 20  # Adjust threshold as needed (e.g., 20 meters)
+  new_states <- reassignDeepDives(baseObj, decoded_states, dive_threshold)
+  
+  # Store the modified state sequence in the data:
+  baseObj$DecodedState <- new_states
+  
+  # Optionally, add the penguin ID as a column (if not already present)
+  if (!"PenguinID" %in% names(baseObj)) {
+    baseObj$PenguinID <- penID
+  }
+  
+  # Save the result for this penguin in the list:
+  all_results[[as.character(penID)]] <- baseObj
+  
+  # 6. Plot dive (maxDepth) versus time colored by the post-processed state:
+  p_time_SA <- ggplot(baseObj, aes(x = time, y = maxDepth, color = factor(DecodedState))) +
+    geom_line() +
+    geom_point(size = 1.2) +
+    labs(title = paste("Penguin", penID, "SA (Post-Processed) - Time vs. maxDepth"),
+         x = "Time", y = "maxDepth (m)", color = "State") +
+    theme_minimal()
+  
+  print(p_time_SA)
+  
+  # 7. Plot trajectory (if x and y coordinates are available):
+  if ("x" %in% names(baseObj) && "y" %in% names(baseObj)) {
+    p_traj_SA <- ggplot(baseObj, aes(x = x, y = y, color = factor(DecodedState))) +
+      geom_point() +
+      labs(title = paste("Penguin", penID, "SA (Post-Processed) - Trajectory"),
+           x = "Longitude", y = "Latitude", color = "State") +
+      scale_color_manual(
+        values = c("1" = "lightblue", "2" = "darkblue", "3" = "grey"),
+        labels = c("1" = "Resting", "2" = "Foraging", "3" = "Transit")
+      ) +
+      theme_minimal()
+    
+    print(p_traj_SA)
+  } else {
+    cat("Coordinates (x, y) not available for trajectory plot for Penguin", penID, "\n")
+  }
+}
+
+
+# 6) Combine All Results and Save as CSV
+
+if (length(all_results) > 0) {
+  combined_results <- bind_rows(all_results)
+  out_file <- file.path(dir_model_out, "All_Penguin_Model_Results.csv")
+  fwrite(combined_results, out_file)
+  message("Saved combined model results to: ", out_file)
+} else {
+  message("No results to combine.")
+}
+
+```
+#HMM: Plot SA Corrected model output 
+```{r}
+
+# Follow-Up: Plot All Penguin Tracks Colored by Behavior State on a Map
+
+# Load required libraries
+library(dplyr)
+library(lubridate)
+library(sf)
+library(ggplot2)
+library(terra)
+library(ggspatial)  # For annotation_scale and annotation_north_arrow
+library(scales)
+library(colorspace)
+library(grid)
+
+# 1) File Paths
+# Adjust these paths if necessary
+penguin_csv <- file.path(dir_model_out, "All_Penguin_Model_Results.csv")
+bedrock_file   <- "~/Desktop/EMPE 2019 Season/R Data Work/FPT Analysis/Makov Model to FPT 2025/IBCSO_v2_bed_RGB.tif"
+ice_file       <- "~/Desktop/EMPE 2019 Season/R Data Work/FPT Analysis/Makov Model to FPT 2025/IBCSO_v2_ice-surface_RGB.tif"
+
+# 2) Load the combined penguin model results CSV
+penguin_data <- fread(penguin_csv)
+penguin_data$time <- ymd_hms(penguin_data$time)
+
+# Ensure the behavior state is a factor with clear labels.
+penguin_data$DecodedState <- factor(penguin_data$DecodedState, 
+                                    levels = c(1, 2, 3),
+                                    labels = c("Resting", "Foraging", "Transit"))
+
+# 3) Load and crop the rasters in the native polar projection
+ibcso_bedrock <- rast(bedrock_file)
+ibcso_ice     <- rast(ice_file)
+
+# Define extent of interest (adjust these values as needed)
+xmin <- -100000; xmax <- 500000
+ymin <- -1550000; ymax <- -1250000
+extent_of_interest <- ext(xmin, xmax, ymin, ymax)
+
+ibcso_bedrock_cropped <- crop(ibcso_bedrock, extent_of_interest)
+ibcso_ice_cropped     <- crop(ibcso_ice, extent_of_interest)
+polar_crs <- crs(ibcso_bedrock_cropped, proj = TRUE)
+
+# 4) Convert rasters to data frames
+bedrock_df <- as.data.frame(ibcso_bedrock_cropped, xy = TRUE) %>%
+  mutate(color = rgb(
+    IBCSO_v2_bed_RGB_1 / 255,
+    IBCSO_v2_bed_RGB_2 / 255,
+    IBCSO_v2_bed_RGB_3 / 255
+  ))
+bedrock_df$color <- lighten(bedrock_df$color, amount = 0.5)
+
+ice_df <- as.data.frame(ibcso_ice_cropped, xy = TRUE) %>%
+  mutate(color = rgb(
+    `IBCSO_v2_ice-surface_RGB_1` / 255,
+    `IBCSO_v2_ice-surface_RGB_2` / 255,
+    `IBCSO_v2_ice-surface_RGB_3` / 255
+  ))
+
+# 5) Convert the combined penguin CSV data to an sf object and reproject to polar CRS
+sf_penguins <- st_as_sf(penguin_data, coords = c("Lon", "Lat"), crs = 4326)
+sf_penguins <- st_transform(sf_penguins, polar_crs)
+coords <- st_coordinates(sf_penguins)
+penguin_data$X <- coords[,1]
+penguin_data$Y <- coords[,2]
+
+# 6) (Optional) If you want to sort or factor penguin IDs, you can do so here.
+# For this example, we simply rely on the data in the CSV.
+
+# 7) Construct the Publication-Ready Map
+
+# Define a transparent rectangle as a background for the scale bar
+rect_grob <- rectGrob(
+  x      = unit(0.18, "npc"),
+  y      = unit(0.08, "npc"),
+  width  = unit(0.28, "npc"),
+  height = unit(0.07, "npc"),
+  just   = "center",
+  gp     = gpar(fill = alpha("white", 0.3), col = NA)
+)
+
+p_map <- ggplot() +
+  # (A) Bedrock background
+  geom_raster(
+    data = bedrock_df,
+    aes(x = -x, y = -y, fill = color),
+    show.legend = FALSE
+  ) +
+  scale_fill_identity() +
+  # (B) Ice overlay
+  geom_raster(
+    data = ice_df,
+    aes(x = -x, y = -y, fill = color),
+    alpha = 0.85,
+    show.legend = FALSE
+  ) +
+  # (C) Penguin track paths colored by behavior state
+  geom_path(
+    data = penguin_data,
+    aes(x = -X, y = -Y, group = PenguinID, color = DecodedState),
+    size = 1,
+    alpha = 0.8
+  ) +
+  # Optionally, add points for each location
+  geom_point(
+    data = penguin_data,
+    aes(x = -X, y = -Y, color = DecodedState),
+    size = 1
+  ) +
+  scale_color_manual(
+    name = "Behavior State",
+    values = c("Resting" = "lightblue", "Foraging" = "darkblue", "Transit" = "grey")
+  ) +
+  # (D) Add scale bar background and the scale bar itself
+  annotation_custom(rect_grob) +
+  annotation_scale(
+    location = "bl",
+    bar_cols = c("white", "black"),
+    line_width = 2,
+    text_cex = 1,
+    height = unit(0.4, "cm")
+  ) +
+  # (E) Add a north arrow in the top-right corner
+  annotation_north_arrow(
+    location = "tr",
+    which_north = "true",
+    height = unit(1, "cm"),
+    width  = unit(1, "cm"),
+    style = north_arrow_fancy_orienteering(
+      line_col = "black",
+      fill = c("white", "black")
+    )
+  ) +
+  # (F) Labels, titles, and caption; convert x/y axis labels to kilometers
+  labs(
+    title = "Penguin Tracks in Polar Projection",
+    subtitle = "Colored by Behavior State",
+    x = "Easting (km)",
+    y = "Northing (km)",
+    caption = "Projection: Polar Stereographic (WGS84)"
+  ) +
+  coord_equal(
+    xlim = c(-500000, -xmin),
+    ylim = c(-ymax, -ymin),
+    expand = FALSE
+  ) +
+  scale_x_continuous(
+    name = "Easting (km)",
+    breaks = pretty_breaks(n = 5),
+    labels = function(x) x / 1000
+  ) +
+  scale_y_continuous(
+    name = "Northing (km)",
+    breaks = pretty_breaks(n = 5),
+    labels = function(x) x / 1000
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text  = element_text(size = 14),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+    plot.subtitle = element_text(size = 16, hjust = 0.5),
+    plot.caption = element_text(hjust = 0, size = 12, face = "italic"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+print(p_map)
+
+
+# Save the Map in High Resolution
+
+ggsave(
+  filename = "Combined_Penguin_Tracks_Polar_Map.png",
+  plot = p_map,
+  width = 180,
+  height = 100,
+  units = "mm",
+  dpi = 300
+)
+
+```
+
+#Plotting HMM SAM for dives: ****Not really important but good check
+-Taylor here is an example code for checking the results its set up for my SAM output but you can adapt.
+-Checking dive profile to see if resting states still have dives
+-Code decodes the most likely state sequence for each penguin using the Viterbi algorithm and then produces plots of time vs. depth and (if coordinates are present) geographic trajectories colored by these inferred states.
+-Result: SAM does a great job of telling you were diving occurs at sea and penguin 12 still only 2 states
+```{r}
+# ------------------------------------------------------------------
+# SETUP & LIBRARIES
+# ------------------------------------------------------------------
+
+# If geosphere is not installed, uncomment the following line:
+# install.packages("geosphere")
+
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(momentuHMM)
+library(geosphere)   # Required for distVincentySphere
+
+# (Optional) Set bitmap type for macOS if needed:
+options(bitmapType = "cairo")
+
+# ------------------------------------------------------------------
+# DIRECTORIES (adjust these paths as necessary)
+# ------------------------------------------------------------------
+dir_fpt       <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/GPS Track At_sea only, filtered, and FPT analysis V2 March 2022"
+dir_dive      <- "/Users/parkerforman/Desktop/EMPE 2019 Season/R Data Work/Stroke Rate by Dive Depth/Data_100hz_DPhase_Dnum"
+dir_out       <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/1hz merged data"
+dir_model_out <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/HMM_Models"
+
+# Create directories if they don't exist
+if(!dir.exists(dir_out)) {
+  dir.create(dir_out, recursive = TRUE)
+}
+if(!dir.exists(dir_model_out)) {
+  dir.create(dir_model_out, recursive = TRUE)
+}
+
+# Define penguin IDs to process
+penguinIDs <- c(3, 4, 5, 7, 9, 12, 18, 19)
+
+# ------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------
+
+# 1. Function to reduce 100 Hz dive data to 1 Hz by aggregating per second
+reduceDiveData1Hz <- function(dive_df, time_col = "Timestamp") {
+  dive_df <- dive_df %>% 
+    mutate(SecondTS = floor_date(.data[[time_col]], "1 second"))
+  
+  dive_1hz <- dive_df %>% 
+    group_by(SecondTS) %>% 
+    summarize(
+      Depth_zoc = mean(Depth_zoc, na.rm = TRUE),
+      D_num     = n_distinct(D_num, na.rm = TRUE),
+      .groups   = "drop"
+    )
+  
+  rename(dive_1hz, Timestamp_1Hz = SecondTS)
+}
+
+# 2. Merge FPT (5-min) data with dive (100 Hz -> 1 Hz) data for a given penguin
+mergePenguinData <- function(penID, dir_fpt, dir_dive, output_dir = NULL) {
+  fpt_file  <- file.path(dir_fpt, paste0("Pen", penID, "_filtered_interp5min_4_FPT.csv"))
+  dive_file <- file.path(dir_dive, paste0("Pen", penID, "_V1.T.X.Y.Z.Act.D_og.Tmp.D_zoc.Dph.Dnum.T_Dm.100hz.csv"))
+  
+  if(!file.exists(fpt_file)) {
+    message("Missing FPT file for Pen", penID)
+    return(NULL)
+  }
+  if(!file.exists(dive_file)) {
+    message("Missing Dive file for Pen", penID)
+    return(NULL)
+  }
+  
+  # (i) Read FPT data
+  data1 <- fread(fpt_file) %>% 
+    mutate(
+      time = ymd_hms(time, quiet = TRUE),
+      Lon  = as.numeric(Lon),
+      Lat  = as.numeric(Lat)
+    )
+  if(nrow(data1) < 1) {
+    message("No rows in FPT for Pen", penID)
+    return(NULL)
+  }
+  
+  start_time <- min(data1$time, na.rm = TRUE)
+  end_time   <- max(data1$time, na.rm = TRUE)
+  
+  # (ii) Read and filter dive data (100 Hz)
+  data2_100hz <- fread(dive_file, select = c("Timestamp", "Depth_zoc (m)", "D_num"), check.names = TRUE) %>% 
+    rename(Depth_zoc = "Depth_zoc..m.") %>% 
+    mutate(
+      Timestamp = parse_date_time(Timestamp, orders = c("mdy HMS", "mdy HMS OS"), exact = FALSE),
+      Depth_zoc = as.numeric(Depth_zoc),
+      D_num     = as.integer(D_num)
+    ) %>% 
+    filter(!is.na(Timestamp), Timestamp >= start_time, Timestamp <= end_time)
+  
+  if(nrow(data2_100hz) < 1) {
+    message("No 100Hz data in time range for Pen", penID)
+    return(NULL)
+  }
+  
+  # (iii) Downsample dive data to 1 Hz
+  data2_1hz <- reduceDiveData1Hz(data2_100hz, time_col = "Timestamp")
+  
+  # (iv) Map each 1Hz dive record to the nearest 5-min FPT record
+  binIndex <- findInterval(data2_1hz$Timestamp_1Hz, data1$time, left.open = TRUE)
+  data2_1hz <- data2_1hz %>% 
+    mutate(bin = binIndex) %>% 
+    filter(bin > 0 & bin <= nrow(data1))
+  
+  if(nrow(data2_1hz) < 1) {
+    message("No 1Hz data matched to bins for Pen", penID)
+    return(NULL)
+  }
+  
+  # (v) Aggregate dive data for each bin
+  data2_agg <- data2_1hz %>% 
+    group_by(bin) %>% 
+    summarize(
+      Max_Depth_zoc  = max(Depth_zoc, na.rm = TRUE),
+      Mean_Depth_zoc = mean(Depth_zoc, na.rm = TRUE),
+      Dive_Variance  = var(D_num, na.rm = TRUE),
+      Dive_Num       = sum(D_num, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  merged_df <- data1 %>% 
+    mutate(bin = row_number()) %>% 
+    left_join(data2_agg, by = "bin") %>% 
+    select(-bin) %>% 
+    filter(!is.na(Lon), !is.na(Lat), !is.na(time))
+  
+  merged_df$ID <- paste0("Pen", penID)
+  
+  # Optionally save the merged file (if output_dir is provided)
+  if(!is.null(output_dir) && nrow(merged_df) > 0) {
+    outFile <- file.path(output_dir, paste0("Pen", penID, "_merged_1Hz.csv"))
+    fwrite(merged_df, outFile)
+    message("Wrote merged 1Hz file for Penguin ", penID, ": ", outFile)
+  }
+  
+  merged_df
+}
+
+# 3. Compute step lengths and turning angles
+computeStepAngleNoReserved <- function(df) {
+  if(nrow(df) < 3) stop("Not enough rows to compute step/angle.")
+  
+  df <- df %>% arrange(time)
+  sdist <- rep(NA, nrow(df))
+  angl  <- rep(NA, nrow(df))
+  
+  for(i in 2:nrow(df)) {
+    sdist[i] <- distVincentySphere(
+      cbind(df$Lon[i-1], df$Lat[i-1]),
+      cbind(df$Lon[i],   df$Lat[i])
+    )
+  }
+  for(i in 3:nrow(df)) {
+    b1 <- bearing(cbind(df$Lon[i-2], df$Lat[i-2]),
+                  cbind(df$Lon[i-1], df$Lat[i-1]))
+    b2 <- bearing(cbind(df$Lon[i-1], df$Lat[i-1]),
+                  cbind(df$Lon[i],   df$Lat[i]))
+    ddeg <- b2 - b1
+    drad <- ddeg * pi / 180
+    drad <- (drad + pi) %% (2*pi) - pi
+    angl[i] <- drad
+  }
+  
+  # Store computed step lengths (in km) and turning angles in the data frame
+  df$userStep  <- sdist / 1000
+  df$userAngle <- angl
+  df
+}
+
+# 4. Fit the SAM model (which includes max dive depth as an observation)
+fitModel_SAM <- function(hmm_data) {
+  nbStates <- 3
+  
+  # Skip if no variation in maxDepth
+  if(sd(hmm_data$maxDepth, na.rm = TRUE) == 0) {
+    message("No variation in maxDepth => skip SAM.")
+    return(NULL)
+  }
+  
+  dist_list <- list(step = "gamma", angle = "vm", maxDepth = "gamma")
+  
+  step_mean <- mean(hmm_data$step, na.rm = TRUE)
+  step_sd   <- sd(hmm_data$step, na.rm = TRUE)
+  stepPar0  <- c(step_mean * 0.5, step_mean, step_mean * 1.5,
+                 step_sd   * 0.5, step_sd,   step_sd   * 1.5)
+  
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+  
+  md_mean <- mean(hmm_data$maxDepth, na.rm = TRUE)
+  md_sd   <- sd(hmm_data$maxDepth, na.rm = TRUE)
+  # 9 initial parameters for the gamma distribution (and zero-inflation)
+  maxDepthPar0 <- c(
+    md_mean * 0.5, md_mean, md_mean * 1.5,
+    md_sd   * 0.5, md_sd,   md_sd   * 1.5,
+    0.01, 0.01, 0.01
+  )
+  
+  Par0 <- list(
+    step     = stepPar0,
+    angle    = anglePar0,
+    maxDepth = maxDepthPar0
+  )
+  
+  DM_list <- list(
+    maxDepth = list(
+      mean     = ~1,
+      sd       = ~1,
+      zeromass = ~1
+    )
+  )
+  
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data       = hmm_data,
+      nbStates   = nbStates,
+      dist       = dist_list,
+      Par0       = Par0,
+      DM         = DM_list,
+      stateNames = c("Resting", "Foraging", "Transit"),
+      estAngleMean = list(angle = TRUE),
+      formula    = ~1
+    )
+  }, error = function(e) {
+    message("Error in fitModel_SAM: ", e$message)
+    NULL
+  })
+  
+  fit
+}
+
+# 5. Prepare the data for HMM and fit both models (only SAM will be used here)
+prepAndFitHMM <- function(df) {
+  df_for_hmm <- df %>% 
+    rename(Lon_ = Lon, Lat_ = Lat) %>% 
+    select(ID, time, Lon_, Lat_, userStep, userAngle, Max_Depth_zoc)
+  
+  baseObj <- momentuHMM:::prepData.default(
+    data       = df_for_hmm,
+    coordNames = c("Lon_", "Lat_"),
+    type       = "LL"
+  )
+  
+  baseObj$step     <- df_for_hmm$userStep
+  baseObj$angle    <- df_for_hmm$userAngle
+  baseObj$maxDepth <- df_for_hmm$Max_Depth_zoc
+  
+  # Remove rows with NA in step/angle
+  baseObj <- baseObj %>% filter(!is.na(step), !is.na(angle))
+  
+  if(nrow(baseObj) < 3) {
+    return(list(SA = NULL, SAM = NULL, hmmData = baseObj))
+  }
+  
+  # Fit both models (we'll use SAM here)
+  fitSAM <- fitModel_SAM(baseObj)
+  
+  list(SA = NULL, SAM = fitSAM, hmmData = baseObj)
+}
+
+# ------------------------------------------------------------------
+# MAIN LOOP: Run Only the SAM Model and Plot Dive (maxDepth) with States
+# ------------------------------------------------------------------
+
+for (penID in penguinIDs) {
+  cat("\n============================================\n")
+  cat("Processing Penguin:", penID, "\n")
+  cat("============================================\n")
+  
+  # 1. Merge the FPT and dive data for the penguin
+  merged_df <- mergePenguinData(penID, dir_fpt, dir_dive)
+  if (is.null(merged_df) || nrow(merged_df) < 3) {
+    cat("Skipping Penguin", penID, ": not enough merged data\n")
+    next
+  }
+  
+  # 2. Compute step lengths and turning angles
+  df_with_steps <- tryCatch({
+    computeStepAngleNoReserved(merged_df)
+  }, error = function(e) {
+    message("Error computing step/angle for Penguin ", penID, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(df_with_steps) || nrow(df_with_steps) < 3) {
+    cat("Skipping Penguin", penID, ": step/angle not computed\n")
+    next
+  }
+  
+  # If needed, ensure there is a max dive depth column (named "Max_Depth_zoc")
+  if (!"Max_Depth_zoc" %in% names(df_with_steps)) {
+    df_with_steps$Max_Depth_zoc <- NA_real_
+  }
+  
+  # 3. Prepare the data for HMM and fit the SAM model only
+  fit_list <- prepAndFitHMM(df_with_steps)
+  fitSAM <- fit_list$SAM  # We are interested in the SAM model only
+  baseObj <- fit_list$hmmData
+  
+  if (is.null(fitSAM)) {
+    cat("SAM model not fitted for Penguin", penID, "\n")
+    next
+  }
+  
+  # 4. Decode the states using Viterbi from the SAM model
+  decoded_states <- viterbi(fitSAM)
+  baseObj$DecodedState <- decoded_states
+  
+  # 5. Plot dive (maxDepth) versus time colored by decoded state
+  p_time_SAM <- ggplot(baseObj, aes(x = time, y = maxDepth, color = factor(DecodedState))) +
+    geom_line() +
+    geom_point(size = 1.2) +
+    labs(title = paste("Penguin", penID, "SAM - Time vs. maxDepth"),
+         x = "Time", y = "maxDepth (m)", color = "State") +
+    theme_minimal()
+  
+  print(p_time_SAM)
+  
+  # 6. Plot trajectory (if x and y coordinates are available)
+  if ("x" %in% names(baseObj) && "y" %in% names(baseObj)) {
+    p_traj_SAM <- ggplot(baseObj, aes(x = x, y = y, color = factor(DecodedState))) +
+      geom_point() +
+      labs(title = paste("Penguin", penID, "SAM - Trajectory"),
+           x = "Longitude", y = "Latitude", color = "State") +
+      scale_color_manual(
+        values = c("1" = "lightblue", "2" = "darkblue", "3" = "grey"),
+        labels = c("1" = "Resting", "2" = "Foraging", "3" = "Transit")
+      ) +
+      theme_minimal()
+    
+    print(p_traj_SAM)
+  } else {
+    cat("Coordinates (x, y) not available for trajectory plot for Penguin", penID, "\n")
+  }
+}
+
+```
+
+
+# Review saved models *** do not need to run unless you want to see what is up.
+```{r}
+# Define the directory where the models are saved
+model_output_dir <- "~/Desktop/EMPE 2019 Season/R Data Work/HMM 2025/HMM_Models"
+
+# Construct the full path to the saved RDS file
+model_file <- file.path(model_output_dir, "Best_HMM_Models_SA_vs_SAM.rds")
+
+# Load the saved models
+best_models <- readRDS(model_file)
+
+# Optional: inspect the loaded models
+str(best_models)
+head(best_models)
+
+#****Code to summarize HMM behavior outputs for all penguins***
+library(ggplot2)
+
+# Loop over each penguin model stored in best_models
+for (penguin in names(best_models)) {
+  model <- best_models[[penguin]]
+  
+  # Check that the model is valid
+  if (!is.null(model) && inherits(model, "momentuHMM")) {
+    
+    # Decode the most likely state sequence using Viterbi
+    states <- viterbi(model)
+    
+    # Retrieve the data that was used for fitting the model
+    # (this should include time and dive information, e.g., maxDepth)
+    data_with_states <- model$data
+    
+    # Add the decoded states as a new column (as numeric values)
+    data_with_states$DecodedState <- states
+    
+    # If state names are provided, map the numeric states to state names.
+    # Otherwise, keep the numeric codes.
+    if (!is.null(model$stateNames)) {
+      data_with_states$StateName <- factor(model$stateNames[as.numeric(states)],
+                                           levels = model$stateNames)
+    } else {
+      data_with_states$StateName <- factor(states)
+    }
+    
+    # Create a ggplot: Time vs. Dive Depth (using maxDepth; adjust if needed)
+    p <- ggplot(data_with_states, aes(x = time, y = maxDepth, color = StateName)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste("Dive Depth vs Time for", penguin),
+           x = "Time",
+           y = "Dive Depth (m)",
+           color = "State") +
+      theme_minimal()
+    
+    # Display the plot (in RStudio or your preferred IDE)
+    print(p)
+    
+    # Optionally, to save the plot to a file, uncomment and modify the following:
+    # out_file <- file.path("path/to/save/directory", paste0(penguin, "_DiveStates.png"))
+    # ggsave(out_file, p, width = 8, height = 5)
+  } else {
+    cat("Penguin", penguin, "does not have a valid model.\n")
+  }
+}
+```
+
+
+

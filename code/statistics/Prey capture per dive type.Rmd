@@ -1,0 +1,222 @@
+---
+title: "Stat analysis prey capture per dive type"
+output: html_document
+date: "2024-08-16"
+---
+
+
+
+
+# Load libraries.
+``` {r libraries}
+library(tidyr)
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2) # for graphing
+library(FSA) # for Dunn's test
+library(purrr)
+library(car)
+```
+
+# Set working directory and import data.
+```{r load}
+# Set working directory
+setwd("/Users/taylorazizeh/Documents/Research/Moss Landing Marine Laboratories/Emperor penguins/Statistics/Prey capture per dive type")
+
+# Load the data
+df_2019_0_15 <- read_csv("2019_prey_capture_0.15.csv")
+df_2019_0_30 <- read_csv("2019_prey_capture_0.30.csv")
+df_2022_0_15 <- read_csv("2022_prey_capture_0.15.csv")
+df_2022_0_30 <- read_csv("2022_prey_capture_0.30.csv")
+```
+
+# Reformat data.
+``` {r}
+# Add year and threshold columns
+df_2019_0_15 <- df_2019_0_15 %>% mutate(year = 2019, threshold = 0.15)
+df_2019_0_30 <- df_2019_0_30 %>% mutate(year = 2019, threshold = 0.30)
+df_2022_0_15 <- df_2022_0_15 %>% mutate(year = 2022, threshold = 0.15)
+df_2022_0_30 <- df_2022_0_30 %>% mutate(year = 2022, threshold = 0.30)
+
+# Combine all data into one dataframe
+combined_data <- bind_rows(df_2019_0_15, df_2019_0_30, df_2022_0_15, df_2022_0_30)
+
+# Reshape data to long format
+long_data <- combined_data %>%
+  pivot_longer(cols = c("Transit", "Epipelagic", "Mesopelagic", "Benthic"),
+               names_to = "dive_type",
+               values_to = "prey_capture")
+```
+
+# Check data for normality using Shapiro-Wilkes test.
+``` {r}
+# Check for normality
+# Apply Shapiro-Wilk test for each combination of dive_type, year, and threshold
+shapiro_results <- long_data %>%
+  group_by(dive_type, year, threshold) %>%
+  summarize(p_value = shapiro.test(prey_capture)$p.value)
+
+# Reformat p-values for easier reading
+shapiro_results$p_value <- format(shapiro_results$p_value, scientific = FALSE)
+
+# View the results
+print(shapiro_results)
+```
+
+# Check histograms for distribution.
+``` {r}
+# Create histograms for prey capture by dive_type, year, and threshold
+ggplot(long_data, aes(x = prey_capture)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black", alpha = 0.7) +
+  facet_grid(dive_type ~ year + threshold) +
+  labs(title = "Histograms of Prey Capture by Dive Type, Year, and Threshold",
+       x = "Prey Capture Attempts",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+# Run a Levene's test for variances.
+``` {r}
+# prey_capture is the dependent variable, and DiveDurationCategory is the grouping variable
+levene_test_result <- leveneTest(prey_capture ~ dive_type, data = long_data)
+
+# View the results of Levene's Test
+print(levene_test_result)
+```
+
+# Run Krusal-Wallis test.
+``` {r}
+# Perform Kruskal-Wallis test for each combination of year and threshold
+kruskal_results <- long_data %>%
+  group_by(year, threshold) %>%
+  summarize(
+    kruskal_test = list(kruskal.test(prey_capture ~ dive_type)),
+    test_statistic = kruskal_test[[1]]$statistic,
+    p_value = kruskal_test[[1]]$p.value
+  )
+
+# Reformat p-values for easier reading
+kruskal_results <- kruskal_results %>%
+  mutate(p_value = format(p_value, scientific = FALSE))
+
+# View the results
+print(kruskal_results)
+```
+
+# Run post-hoc pairwise comparison.
+``` {r}
+# Perform Dunn's test with Bonferroni adjustment for p-values
+dunn_test_results <- dunnTest(prey_capture ~ dive_type, data = long_data, method = "bonferroni")
+
+# Make p-values easier to read
+dunn_test_results$P.adj <- format(dunn_test_results$P.adj, scientific = FALSE)
+
+# View the results of Dunn's test
+print(dunn_test_results)
+
+# Extract significant comparisons
+significant_results <- dunn_test_results$res %>%
+  filter(P.adj < 0.05)
+
+# Reformat p-values for easier reading
+significant_results$P.adj <- format(significant_results$P.adj, scientific = FALSE)
+
+# View significant pairwise comparisons
+print(significant_results)
+```
+
+
+# Create meaningful figure.
+``` {r}
+# Extract the results from the Dunn's test object
+heatmap_data <- dunn_test_results$res %>%
+  separate(Comparison, into = c("Group1", "Group2"), sep = " - ") %>%
+  mutate(Significance = case_when(
+    P.adj < 0.001 ~ "***",
+    P.adj < 0.01 ~ "**",
+    P.adj < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )) %>%
+  # Join the year and threshold information back to the heatmap_data
+  left_join(select(long_data, dive_type, year, threshold), by = c("Group1" = "dive_type"))
+
+
+# Create the heatmap with blue gradients, faceted by year and threshold
+ggplot(heatmap_data, aes(x = Group1, y = Group2, fill = Z)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Significance), color = "white", size = 5) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      name = "Z-Score") +
+  labs(title = "Heatmap of Pairwise Comparisons from Dunn's Test",
+       x = "Dive Type 1", y = "Dive Type 2") +
+  facet_grid(year ~ threshold) +  # Facet by year and threshold
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_blank())
+```
+
+# Benthic vs. pelagic test.
+``` {r}
+# Combine epipelagic and mesopelagic
+long_data_pelagic <- long_data %>%
+  mutate(dive_type = ifelse(dive_type %in% c("Mesopelagic", "Epipelagic"), "Pelagic", dive_type)) %>%
+  group_by(year, threshold, dive_type) %>%
+  summarize(prey_capture = sum(prey_capture, na.rm = TRUE))
+```
+
+# Run Shapiro-Wilk on new group
+``` {r}
+# Recheck normality for Pelagic and Benthic categories
+shapiro_results_pelagic_benthic <- long_data_pelagic %>%
+  filter(dive_type %in% c("Pelagic", "Benthic")) %>%
+  group_by(dive_type) %>%
+  summarize(p_value = shapiro.test(prey_capture)$p.value)
+
+# Reformat p-value for easier reading
+shapiro_results_pelagic_benthic$p_value <- format(shapiro_results_pelagic_benthic$p_value, scientific = FALSE)
+
+# View the Shapiro-Wilk test results
+print(shapiro_results_pelagic_benthic)
+```
+
+# Check variances
+``` {r}
+# Perform Levene's Test to check for equal variances
+filtered_data <- long_data_pelagic %>%
+  filter(dive_type %in% c("Pelagic", "Benthic"))
+
+levene_test <- leveneTest(prey_capture ~ dive_type, data = filtered_data)
+
+# View the results of Levene's Test
+print(levene_test)
+```
+
+# Since data are normally distributed and the variances are unequal, we can run a Welch's t-test
+``` {r}
+# Perform Welch's t-test, which does not assume equal variances
+welch_t_test_pelagic_benthic <- t.test(prey_capture ~ dive_type, data = filtered_data, var.equal = FALSE)
+
+# View the results of Welch's t-test
+print(welch_t_test_pelagic_benthic)
+```
+
+# Graph results.
+``` {r}
+ggplot(filtered_data, aes(x = dive_type, y = prey_capture, fill = dive_type)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  scale_y_log10() +  # Log transformation of the y-axis
+  labs(title = "Distribution of Prey Capture Attempts by Dive Class (Log Scale)",
+       x = "Dive Type", y = "Prey Capture Attempts (Log Scale)") +  # Remove legend title
+  theme_minimal() +
+  scale_fill_brewer(palette = "Blues") +
+  theme(
+    plot.title = element_text(size = 9),  # Adjust title text size
+    axis.title = element_text(size = 9),  # Adjust axis labels text size
+    axis.text = element_text(size = 9),   # Adjust axis text size
+    legend.position = "none"  # Remove the legend
+  )
+```
+
+

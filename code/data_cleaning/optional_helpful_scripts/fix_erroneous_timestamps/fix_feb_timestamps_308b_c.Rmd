@@ -1,0 +1,123 @@
+---
+title: "fix_timestamps_308b_c"
+author: "Taylor Azizeh"
+date: "2025-01-21"
+output: html_document
+---
+
+Title: Fix 308b and 308c timestamps
+Author: Taylor Azizeh
+Date: 21 January 2025
+Description: This short script is used to interpolate the corrected/ZOCed timestamps from 1Hz to 50Hz for alignment with acceleration and depth data.
+
+``` {r}
+# Load libraries
+library(ncdf4)
+```
+
+```{r}
+# Set working directory
+setwd('/Users/taylorazizeh/Library/CloudStorage/GoogleDrive-taylor.azizeh@sjsu.edu/.shortcut-targets-by-id/1qVmvBCQU8aplOO73CUX_mqRay94h7cgI/Penguin_Shared/Data/Crozier/2022/Processed files/1Hz/Dive data/time_pressure_corrected_ZOC')
+
+# Set options to show more digits
+options(digits = 15)
+
+# Import ZOC concat data
+raw <- fread("22EP_308c_DAprep_full_iknos_rawzoc_data.csv")
+head(raw)
+```
+
+``` {r}
+# Convert MATLAB serial date to datetime 
+# Start time
+start_time_matlab <- raw$time[1]
+
+# Convert MATLAB serial to POSIXct (datetime in R)
+origin <- as.POSIXct("0000-01-01", tz = "UTC") - 1  # MATLAB origin
+start_time <- origin + (start_time_matlab * 86400)  # Convert days to seconds
+
+# Check the converted datetime
+print(start_time)  # Should be in datetime format
+```
+
+```{r}
+# Convert to ISO 8601
+start_time_iso <- format(start_time, "%Y-%m-%dT%H:%M:%OSZ")
+print(start_time_iso)  # ISO 8601 format with fractional seconds
+```
+
+```{r}
+# Parameters
+num_timestamps <- 38811401  # Total timestamps
+sampling_frequency <- 50    # Frequency in Hz
+
+# Generate a sequence of timestamps
+timestamps <- seq(from = start_time, 
+                  by = 1 / sampling_frequency, 
+                  length.out = num_timestamps)
+
+# Convert the sequence to ISO 8601
+timestamps_iso <- format(timestamps, "%Y-%m-%dT%H:%M:%OSZ")
+
+# Check the first few and last few timestamps
+head(timestamps_iso)
+tail(timestamps_iso)
+```
+
+``` {r}
+# Define file path and ensure directory exists
+output_dir <- "/Users/taylorazizeh/Documents/Research/active/Emperor penguins/data/cleaned/timestamps/fucked up"
+if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+}
+output_file <- file.path(output_dir, "timestamps_50Hz_ISO8601.nc")
+
+# Remove the file if it exists
+if (file.exists(output_file)) {
+    file.remove(output_file)
+}
+
+# Define the dimension for NetCDF
+time_dim <- ncdim_def(name = "time_index", 
+                      units = "index", 
+                      vals = seq_len(num_timestamps), 
+                      unlim = FALSE)
+
+# Define the variable for ISO 8601 timestamps
+time_var <- ncvar_def(name = "Timestamp", 
+                      units = "ISO 8601 (UTC)", 
+                      dim = list(time_dim), 
+                      prec = "char")
+
+# Create the NetCDF file
+if (exists("nc")) {
+    try(nc_close(nc), silent = TRUE)
+}
+nc <- nc_create(output_file, vars = list(time_var))
+
+# Write the ISO 8601 timestamps to the NetCDF file
+ncvar_put(nc, time_var, timestamps_iso)
+
+# Close the NetCDF file
+nc_close(nc)
+
+cat("NetCDF file with ISO 8601 timestamps created successfully:", output_file)
+
+# Check the difference between consecutive timestamps
+diffs <- diff(timestamps)
+print(head(diffs))  # Should all be 0.02 seconds
+```
+
+``` {r}
+nc <- nc_open(output_file)
+timestamps_from_file <- ncvar_get(nc, "Timestamp")
+nc_close(nc)
+
+# Convert back to datetime
+#timestamps_datetime <- as.POSIXct(timestamps_from_file, format = "%Y-%m-%dT%H:%M:%OSZ", tz = "UTC")
+
+# Check the first few and last few timestamps
+head(timestamps_from_file)
+tail(timestamps_from_file)
+```
+

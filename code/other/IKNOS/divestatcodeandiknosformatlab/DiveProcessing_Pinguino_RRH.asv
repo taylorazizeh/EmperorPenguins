@@ -1,0 +1,25 @@
+%Rachel Holser (rholser@ucsc.edu)
+%Created 22-Jun-2022
+%Updated 22-Jun-2022
+
+%Consolidates all dive processing steps into one script.
+%Requires "New IKNOS" toolbox and modified/custom functions:
+    %For Step 1 (full resolution ZOC and Dive Analysis):
+        %DA_data_compiler_pinguinos_RRH.m
+        %change_format_DA_pinguino_RRH.m
+        %yt_iknos_DA_RRH.m
+        
+%Run change_format_DA_RRH. Also Requires function DA_data_compiler_RRH.m
+
+%This process should not be run in parallel (or in multiple instances of
+%matlab) as the function writes temporary files - if multiple instances are
+%run, the IKNOS DA function will mix tdr records together.
+
+clear
+file=dir('22_*.csv');
+
+%for k=2:length(file)
+for k=8:14
+    ChangeFormat_DA_Pinguino(file(k).name);
+end
+

@@ -1,0 +1,717 @@
+---
+title: "penguin_HMM_modeling"
+author: "Taylor Azizeh"
+date: "2025-02-28"
+output: html_document
+---
+
+**Title**: Hidden Markov Modelling for foraging emperor penguins   
+**Contact**: taylorazizeh@gmail.com  
+**Author**: Taylor Azizeh (adapted from code by Parker Forman)
+**Description**: This code walks through fitting a Hidden Markov model to foraging emperor penguin data. This code runs through: importing and reformatting data, visualizing the data,
+
+
+STEP I: Load and reformat data.
+```{r}
+# Load libraries
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(momentuHMM)
+library(terra) # for plotting
+library(sf) # for plotting
+library(MASS)  # For fitting negative binomial models
+library(performance)
+library(ggplot2)
+library(ggspatial) # for plotting
+library(viridis) # for plotting
+library(geosphere)
+library(readr)      # if you are using read_csv/write_csv
+library(beepr)      # if you want the beep()
+```
+
+```{r}
+# Because your environment lacks logLik.momentuHMM, define it:
+logLik.momentuHMM <- function(object, ...) {
+  if(!inherits(object, "momentuHMM"))
+    stop("Need a momentuHMM object")
+  # momentuHMM typically stores negative log-likelihood in object$mod$minimum
+  -object$mod$minimum
+}
+
+# Similarly, define a BIC method for momentuHMM:
+BIC.momentuHMM <- function(object, ...) {
+  if(!inherits(object, "momentuHMM"))
+    stop("Need a momentuHMM object")
+  # SAPple size
+  n <- nrow(object$data)
+  # Number of parameters (estimated)
+  k <- length(object$mod$estimate)
+  # Log-likelihood:
+  ll <- logLik.momentuHMM(object)
+  # BIC calculation:
+  -2 * ll + k * log(n)
+}
+```
+
+```{r}
+# Import GPS data
+gps <- read.csv('/Users/taylorazizeh/Documents/research/active/Emperor penguins/data/cleaned/gps interpolated/fixed timestamps/cleaned_GPS_data_all_years.csv')
+head(gps)
+
+# Import prey capture data
+prey <- read.csv('/Users/taylorazizeh/Documents/research/active/emperor penguins/results/MATLAB/final/prey_capture_results.csv')
+head(prey)
+
+# Subset prey data
+myvars <- c("BirdID", "DiveNumber", "DiveStartTime", "DiveDuration", "TotalEvents", "ODBA_Total", "DiveType")
+prey <- prey[myvars]
+
+# Remove "x" in front of IDs from MATLAB data
+prey <- prey %>%
+  mutate(BirdID = sub("^x", "", BirdID))
+
+# Remove no GPS birds from dataset
+prey <- prey %>%
+  filter(!(BirdID %in% c("22EP_310c", "22EP_308c")))
+
+# Set IDs
+penguinIDs <- unique(prey$BirdID)
+print(penguinIDs)
+```
+
+``` {r}
+# Rename and format
+gps$Timestamp <- as.POSIXct(gps$Timestamp)
+prey$DiveStartTime <- as.POSIXct(prey$DiveStartTime, format = "%d-%b-%Y %H:%M:%OS")
+
+# Check class
+str(gps$Timestamp)
+str(prey$DiveStartTime)
+
+# Rename DiveStartTime to Timestamp
+prey <- prey %>% 
+  rename(Timestamp = DiveStartTime)
+```
+
+```{r}
+# Set as data tables
+prey <- as.data.table(prey)
+gps <- as.data.table(gps)
+
+# Pair GPS and prey data
+setkey(gps, ID, Timestamp)
+setkey(prey, BirdID, Timestamp)
+
+# Perform a rolling join within each bird ID:
+paired_data <- gps[prey, roll = "nearest"] # For each dive, the join finds the nearest GPS point in time
+
+# Display the paired data
+print(paired_data)
+```
+
+STEP II: Visualize the data.
+```{r}
+# Dive duration (should be between 20s and 1000s)
+hist(paired_data$DiveDuration)
+summary(paired_data$DiveDuration)
+
+# Total prey capture events
+hist(paired_data$TotalEvents)
+summary(paired_data$TotalEvents)
+
+# Total ODBA
+hist(paired_data$ODBA_Total)
+summary(paired_data$ODBA_Total)
+
+# There is one outrageous outlier so let's check that out and remove it
+max(paired_data$ODBA_Total) # This is obviously erroenous
+paired_data <- paired_data %>%
+  slice(-14628)  # Removes row with outlier
+
+# Total prey capture events
+hist(paired_data$TotalEvents)
+summary(paired_data$TotalEvents)
+
+# Total ODBA
+hist(paired_data$ODBA_Total)
+summary(paired_data$ODBA_Total)
+
+# That looks much better!
+```
+
+```{r}
+# Normalize prey capture events relative to each penguin's track
+paired_data <- paired_data %>%
+  group_by(ID) %>%
+  mutate(
+    ScaledTotalEvents = scales::rescale(TotalEvents, to = c(0, 1)) # Scale 0 to 1 for each penguin
+  ) %>%
+  ungroup()
+
+# Load IBCSO bathymetry raster
+ibcso_bedrock_path <- "/Users/taylorazizeh/Documents/research/active/Emperor penguins/data/cleaned/bathymetry/IBCSO_v2_bed_RGB.tif" 
+ibcso_ice_path <- "/Users/taylorazizeh/Documents/research/active/Emperor penguins/data/cleaned/bathymetry/IBCSO_v2_ice-surface_RGB.tif"
+
+# Convert to a raster
+ibcso_bedrock <- rast(ibcso_bedrock_path)
+ibcso_ice <- rast(ibcso_ice_path)
+
+# Define region of interest
+xmin <- -100000
+xmax <- 500000
+ymin <- -1550000
+ymax <- -1250000
+extent_of_interest <- ext(xmin, xmax, ymin, ymax)
+
+# Crop bathymetry and ice rasters
+ibcso_bedrock_cropped <- crop(ibcso_bedrock, extent_of_interest)
+ibcso_ice_cropped <- crop(ibcso_ice, extent_of_interest)
+
+# Convert bathymetry raster to data frame for ggplot
+bedrock_df <- as.data.frame(ibcso_bedrock_cropped, xy = TRUE) %>%
+  mutate(color = rgb(
+    IBCSO_v2_bed_RGB_1 / 255,
+    IBCSO_v2_bed_RGB_2 / 255,
+    IBCSO_v2_bed_RGB_3 / 255
+  ))
+
+# Convert ice raster to data frame for ggplot
+ice_df <- as.data.frame(ibcso_ice_cropped, xy = TRUE) %>%
+  mutate(color = rgb(
+    `IBCSO_v2_ice-surface_RGB_1` / 255,
+    `IBCSO_v2_ice-surface_RGB_2` / 255,
+    `IBCSO_v2_ice-surface_RGB_3` / 255
+  ))
+```
+
+```{r}
+# Convert penguin data to sf object (WGS84)
+pen_data_sf <- st_as_sf(
+  paired_data,
+  coords = c("Lon", "Lat"),
+  crs = 4326
+)
+
+# Transform penguin data to match IBCSO CRS
+pen_data_sf <- st_transform(pen_data_sf, crs(ibcso_bedrock_cropped))
+
+# Convert back to data frame for ggplot
+pen_data_transformed <- pen_data_sf %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  bind_cols(pen_data_sf %>% st_drop_geometry()) %>%
+  rename(x = X, y = Y)
+
+# Plotting
+fig2 <- ggplot() +
+  # Add bathymetry raster
+  geom_raster(
+    data = bedrock_df,
+    aes(x = -x, y = -y, fill = color),
+    show.legend = FALSE
+  ) +
+  scale_fill_identity() +  # Use the 'color' column directly
+  
+  # Add ice raster with transparency
+  geom_raster(
+    data = ice_df,
+    aes(x = -x, y = -y, fill = color),
+    alpha = 0.7,
+    show.legend = FALSE
+  ) +
+  
+  # Add penguin tracks, color-coded by ID
+  geom_point(
+    data = pen_data_transformed,
+    aes(x = -x, y = -y, color = ScaledTotalEvents),
+    size = 0.8,
+    alpha = 0.8
+  ) +
+    
+  # Color scale for relative prey capture events
+  scale_color_viridis_c(name = "Rel. Prey Capture") +
+  
+  # Add scale bar and north arrow
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(location = "tr",
+                         style = north_arrow_orienteering(),
+                         height = unit(1.0, "cm"),
+                         width = unit(1.0, "cm"),
+                         pad_x = unit(0.25, "cm"),
+                         pad_y = unit(0.25, "cm")) +
+  
+  # Add titles and labels
+  labs(
+    title = "Penguin Tracks with Relative Prey Capture ",
+    x = "Projected X (meters)",
+    y = "Projected Y (meters)"
+  ) +
+  
+  # Coordinate system and theme
+  coord_sf(crs = st_crs(ibcso_bedrock_cropped), expand = FALSE) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.key.width = unit(0.05, "lines"),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 8)) +
+  guides(color = guide_legend(ncol = 1))  # Adjust columns
+
+print(fig2)
+
+# Save Figure 2
+ggsave(fig2, 
+       filename = "figure2.jpeg",
+       device = "jpeg",
+       path = "/Users/taylorazizeh/Documents/research/active/Emperor penguins/figures/figures",
+       height = 5, width = 7, units = "in")
+```
+
+STEP III: Test for overdispersion and run HMM.
+```{r}
+# Test for overdispersion
+test_nb <- glm.nb(TotalEvents ~ 1, data = paired_data)
+check_overdispersion(test_nb)
+```
+
+```{r}
+# Prepare data for HMM
+df <- paired_data %>%
+  dplyr::select(ID, Lon, Lat, Timestamp, TotalEvents, ODBA_Total, DiveType)
+
+df <- as.data.frame(df)
+
+# Check it
+head(df)
+
+# Use the function prepData
+df <- prepData(df,
+               type = c("LL"),
+               coordNames = c("Lon", "Lat"),
+               covNames = c("TotalEvents", "ODBA_Total", "DiveType"))
+# Check it
+head(df)
+plot(df, compact = TRUE, ask = FALSE)
+```
+
+```{r}
+# Make histogram of step lengths and angles
+hist(df$step,
+     xlab = "step length",
+     main = "")
+summary(df$step) # Maximum is 35
+
+hist(df$angle,
+     xlab = "turning angle",
+     main = "")
+summary(df$angle)
+```
+
+```{r}
+# Define output folder
+dir_model_out <- "/Users/taylorazizeh/Documents/research/active/Emperor penguins/results/HMM"
+
+# We'll define custom state names = c("Resting","Foraging","Transit")
+fitModel_SA <- function(df) {
+  nbStates <- 3
+  dist_list <- list(step="gamma", angle="vm")
+
+  step_mean <- mean(df$step, na.rm=TRUE)
+  step_sd   <- sd(df$step, na.rm=TRUE)
+  stepPar0  <- c(step_mean*0.5, step_mean, step_mean*1.5,
+                 step_sd*0.5,   step_sd,   step_sd*1.5)
+
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+
+  Par0 <- list(step=stepPar0, angle=anglePar0)
+
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data         = df,
+      nbStates     = nbStates,
+      dist         = dist_list,
+      Par0         = Par0,
+      stateNames   = c("Resting","Foraging","Transit"),
+      estAngleMean = list(angle=TRUE),
+      formula      = ~1
+    )
+  }, error=function(e){
+    message("Error in fitModel_SA: ", e$message)
+    NULL
+  })
+  fit
+}
+
+#################################  Helper: assign biological state labels to states 1, 2, 3
+assignStateLabels <- function(fit) {
+  step_means  <- fit$mle$step[1, ]
+  angle_kappa <- fit$mle$angle[2, ]
+
+  label_vector <- rep(NA, 3)
+
+  # Transit: highest step length and high directional persistence
+  transit_idx <- which.max(step_means)
+  label_vector[transit_idx] <- "Transit"
+
+  # Among remaining, Resting = shortest steps + most directed (highest kappa)
+  remaining <- setdiff(1:3, transit_idx)
+  kappa_sub <- angle_kappa[remaining]
+  step_sub  <- step_means[remaining]
+
+  resting_idx <- remaining[which.max(kappa_sub / step_sub)]  # smallest step + highest directionality
+  label_vector[resting_idx] <- "Resting"
+
+  # Remaining = Foraging (short step, high turning = lowest kappa)
+  foraging_idx <- setdiff(1:3, c(transit_idx, resting_idx))
+  label_vector[foraging_idx] <- "Foraging"
+
+  return(label_vector)
+}
+
+################################# Fit Step-Angle-Prey
+# Define SAP model function
+fitModel_SAP <- function(df) {
+  nbStates <- 3  # Three states: Resting, Foraging, Transit
+
+  dist_list <- list(step="gamma", angle="vm", TotalEvents="pois") 
+
+  step_mean <- mean(df$step, na.rm=TRUE)
+  step_sd   <- sd(df$step, na.rm=TRUE)
+  stepPar0  <- c(step_mean*0.5, step_mean, step_mean*1.5,
+                 step_sd*0.5,   step_sd,   step_sd*1.5)
+
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+  
+  prey_mean <- mean(df$TotalEvents, na.rm=TRUE)
+  prey_sd   <- sd(df$TotalEvents, na.rm=TRUE)
+  preyPar0  <- c(prey_mean*0.5, prey_mean, prey_mean*1.5)
+
+  Par0 <- list(step=stepPar0, angle=anglePar0, TotalEvents=preyPar0)
+
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data         = df,
+      nbStates     = nbStates,
+      dist         = dist_list,
+      Par0         = Par0,
+      stateNames   = c("Resting","Foraging","Transit"),
+      estAngleMean = list(angle=TRUE),
+      formula      = ~1
+    )
+  }, error=function(e){
+    message("Error in fitModel_SAP: ", e$message)
+    NULL
+  })
+  fit
+}
+
+################################# Fit Step-Angle-Prey (ZI)
+fitModel_SAP_ZI <- function(hmm_data) {
+  nbStates <- 3  # Three states: Resting, Foraging, Transit
+
+  # Skip if no variation in prey capture events
+  if (sd(hmm_data$TotalEvents, na.rm=TRUE) == 0) {
+    message("No variation in TotalEvents => skip SAP-ZI.")
+    return(NULL)
+  }
+
+  # Use Negative Binomial (handles zero-inflation naturally)
+  dist_list <- list(
+    step = "gamma",
+    angle = "vm",
+    TotalEvents = "negbinom"  # No need for explicit zero-inflation parameter
+  )
+
+  # Step parameters
+  step_mean <- mean(hmm_data$step, na.rm=TRUE)
+  step_sd   <- sd(hmm_data$step, na.rm=TRUE)
+  stepPar0  <- c(step_mean*0.5, step_mean, step_mean*1.5,
+                 step_sd*0.5,   step_sd,   step_sd*1.5)
+
+  # Angle parameters
+  anglePar0 <- c(rep(0, nbStates), rep(1, nbStates))
+
+  # Prey capture parameters (Negative Binomial)
+  prey_mean <- mean(hmm_data$TotalEvents, na.rm=TRUE)
+  prey_sd   <- sd(hmm_data$TotalEvents, na.rm=TRUE)
+
+  # Negative Binomial requires: 3 mean params (mu) + 3 dispersion params (size)
+  preyPar0  <- c(
+    prey_mean*0.5, prey_mean, prey_mean*1.5,  # Mean prey capture rate (mu)
+    2, 2, 2  # Dispersion parameters (size)
+  )
+
+  Par0 <- list(
+    step = stepPar0,
+    angle = anglePar0,
+    TotalEvents = preyPar0
+  )
+
+  # Corrected Design Matrix (must include mu and size)
+  DM_list <- list(
+    TotalEvents = list(
+      mu   = ~1,  # Mean prey capture rate (lambda)
+      size = ~1   # Overdispersion (models excess zeros)
+    )
+  )
+
+  # Fit HMM with Negative Binomial
+  fit <- tryCatch({
+    momentuHMM:::fitHMM.momentuHMMData(
+      data       = hmm_data,
+      nbStates   = nbStates,
+      dist       = dist_list,
+      Par0       = Par0,
+      DM         = DM_list,  # Now correctly includes both mu & size
+      stateNames = c("Resting","Foraging","Transit"),
+      estAngleMean = list(angle=TRUE),
+      formula    = ~1
+    )
+  }, error=function(e){
+    message("Error in fitModel_SAP_ZI: ", e$message)
+    NULL
+  })
+
+  fit
+}
+
+
+################################# Prepare & fit
+prepAndFitHMM <- function(df) {
+  baseObj <- df  # Use the already prepared dataset
+
+  if (!all(c("step", "angle", "TotalEvents") %in% names(baseObj))) {
+    stop("Error: The dataset must contain 'step', 'angle', and 'TotalEvents' columns.")
+  }
+
+  # Remove rows with NA in step or angle
+  baseObj <- baseObj %>%
+    filter(!is.na(step), !is.na(angle))
+
+  if(nrow(baseObj) < 3) {
+    return(list(SA=NULL, SAP=NULL, SAP_ZI=NULL, hmmData=baseObj))
+  }
+
+  # Fit SA & SAP models
+  fitSA  <- fitModel_SA(baseObj)
+  fitSAP <- fitModel_SAP(baseObj)
+
+  # Fit SAP-ZI (zero-inflated prey capture) only if there’s variation in TotalEvents
+  fitSAP_ZI <- if (sd(baseObj$TotalEvents, na.rm=TRUE) > 0) {
+    fitModel_SAP_ZI(baseObj)
+  } else {
+    message("No variation in TotalEvents => skipping SAP-ZI.")
+    NULL
+  }
+
+  list(SA=fitSA, SAP=fitSAP, SAP_ZI=fitSAP_ZI, hmmData=baseObj)
+}
+
+################################# We'll keep the existing summary of "best" models:
+bestModels   <- list()
+summaryTable <- data.frame(
+  ID         = character(),
+  Best_Model = character(),
+  AIC        = numeric(),
+  BIC        = numeric(),
+  stringsAsFactors=FALSE
+)
+
+# Summaries for ALL SA & SAP models:
+summaryAllModels <- data.frame(
+  ID    = character(),
+  Model = character(),
+  AIC   = numeric(),
+  BIC   = numeric(),
+  stringsAsFactors=FALSE
+)
+
+# Load patchwork if needed
+if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork")
+library(patchwork)
+
+# Fit all three models, compare, and only plot the best fit
+for (penID in penguinIDs) {
+  cat("\n============================================\n")
+  cat("PROCESSING PENGUIN:", penID, "\n")
+  cat("============================================\n")
+
+  df_filtered <- df %>% filter(ID == penID)
+  if (nrow(df_filtered) == 0) {
+    cat("No data for", penID, "\n")
+    next
+  }
+
+  # Fit models
+  fit_list   <- prepAndFitHMM(df_filtered)
+  fitSA      <- fit_list$SA
+  fitSAP     <- fit_list$SAP
+  fitSAP_ZI  <- fit_list$SAP_ZI
+  baseObj    <- fit_list$hmmData
+  baseObj$Timestamp <- as.POSIXct(baseObj$Timestamp, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+  # Store valid models
+  fittedModels <- list()
+  if (!is.null(fitSA)     && inherits(fitSA, "momentuHMM"))     fittedModels[["SA"]]     <- fitSA
+  if (!is.null(fitSAP)    && inherits(fitSAP, "momentuHMM"))    fittedModels[["SAP"]]    <- fitSAP
+  if (!is.null(fitSAP_ZI) && inherits(fitSAP_ZI, "momentuHMM")) fittedModels[["SAP_ZI"]] <- fitSAP_ZI
+
+  if (length(fittedModels) == 0) {
+    cat("No valid models for", penID, "\n")
+    next
+  }
+
+  # Get AIC/BIC values
+  modelAICs <- sapply(fittedModels, function(m) tryCatch(AIC(m), error = function(e) NA_real_))
+  modelBICs <- sapply(fittedModels, function(m) tryCatch(BIC(m), error = function(e) NA_real_))
+
+  # Append to summary of all models
+  for (mName in names(fittedModels)) {
+    summaryAllModels <- rbind(summaryAllModels, data.frame(
+      ID    = paste0("Pen", penID),
+      Model = mName,
+      AIC   = modelAICs[mName],
+      BIC   = modelBICs[mName],
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  # Identify best model by AIC
+  if (all(is.na(modelAICs))) {
+    cat("All model AICs NA — skipping", penID, "\n")
+    next
+  }
+
+  bestModelType <- names(which.min(modelAICs))
+  bestModel     <- fittedModels[[bestModelType]]
+  bestAIC       <- modelAICs[bestModelType]
+  bestBIC       <- modelBICs[bestModelType]
+
+  cat("\n>>> Best model for", penID, "is", bestModelType,
+      "with AIC =", bestAIC, "| BIC =", bestBIC, "\n")
+
+  # Save best model info
+  summaryTable <- rbind(summaryTable, data.frame(
+    ID         = paste0("Pen", penID),
+    Best_Model = bestModelType,
+    AIC        = bestAIC,
+    BIC        = bestBIC,
+    stringsAsFactors = FALSE
+  ))
+  bestModels[[paste0("Pen", penID)]] <- bestModel
+
+  # Decode and assign behavioral state labels
+  decodedStates <- viterbi(bestModel)
+  
+  # Use helper to assign biological labels
+  state_labels <- assignStateLabels(bestModel)
+  
+  # Validation printout
+  cat("→ Step means:", paste(round(bestModel$mle$step[1, ], 2), collapse = ", "), "\n")
+  cat("→ Angle kappa:", paste(round(bestModel$mle$angle[2, ], 2), collapse = ", "), "\n")
+  cat("→ Assigned labels:", paste(state_labels, collapse = ", "), "\n")
+  
+  # Check for errors or NA in labeling
+  if (length(state_labels) != 3 || any(is.na(state_labels))) {
+    warning("Invalid state_labels. Falling back to generic labels.")
+    state_labels <- c("State1", "State2", "State3")
+  }
+  
+  # Assign labels to states
+  decoded_named <- factor(decodedStates, levels = 1:3, labels = state_labels)
+  
+  # Reclassify "Resting" during foraging-type dives as "Foraging"
+  if ("DiveType" %in% names(baseObj)) {
+    decoded_named <- as.character(decoded_named)  # avoid factor/ifelse mismatch
+  
+    reclass_idx <- decoded_named == "Resting" & baseObj$DiveType %in% c("Epipelagic", "Mesopelagic", "Benthic")
+    decoded_named[reclass_idx] <- "Foraging"
+  
+    # Report how many were reclassified
+    num_reclassified <- sum(reclass_idx, na.rm = TRUE)
+    cat("✔ Reclassified", num_reclassified, "Resting → Foraging (due to dive type)\n")
+  
+    # Finalize factor with expected levels
+    decoded_named <- factor(decoded_named, levels = c("Resting", "Foraging", "Transit"))
+  }
+  
+  # Assign to baseObj
+  baseObj$DecodedState <- decoded_named
+  
+  # Diagnostic: check final state counts
+  cat("✔ DecodedState counts:\n")
+  print(table(baseObj$DecodedState, useNA = "always"))
+  
+  # Save decoded CSV
+  decoded_csv <- file.path(dir_model_out, paste0("Pen", penID, "_DecodedStates_", bestModelType, ".csv"))
+  data.table::fwrite(baseObj, decoded_csv)
+  cat("✔ Saved decoded states to:", decoded_csv, "\n")
+
+  # Spatial plot if x/y available
+  if (all(c("x", "y") %in% names(baseObj))) {
+    baseObj <- baseObj %>% filter(!is.na(x), !is.na(y))
+
+    # Plot 1: Colored by HMM state
+    p_state <- ggplot(baseObj, aes(x = x, y = y)) +
+      geom_path(color = "grey90") +
+      geom_point(aes(color = DecodedState), size = 2, alpha = 0.9) +
+      scale_color_manual(
+        values = c(
+          "Resting" = "lightblue",
+          "Foraging" = "darkblue",
+          "Transit" = "lightgrey"
+        ),
+        name = "State"
+      ) +
+      labs(
+        title = "Penguin Track Colored by HMM States",
+        x = "Longitude", y = "Latitude"
+      ) +
+      coord_fixed(ratio = 1.3) +
+      theme_minimal()
+    
+    # Plot 2: Colored by prey capture events
+    p_prey <- ggplot(baseObj, aes(x = x, y = y)) +
+      geom_path(color = "grey90") +
+      geom_point(aes(color = TotalEvents), size = 2, alpha = 0.9) +
+      scale_color_viridis_c(
+        option = "plasma",
+        name = "Prey Capture Events",
+        direction = -1  # darkest colors = highest events
+      ) +
+      labs(
+        title = "Penguin Track Colored by Prey Capture Events",
+        x = "Longitude", y = "Latitude"
+      ) +
+      coord_fixed(ratio = 1.3) +
+      theme_minimal()
+    
+    # Set consistent x/y limits
+    xlim_vals <- range(baseObj$x, na.rm = TRUE)
+    ylim_vals <- range(baseObj$y, na.rm = TRUE)
+
+    p_state <- p_state + xlim(xlim_vals) + ylim(ylim_vals)
+    p_prey  <- p_prey  + xlim(xlim_vals) + ylim(ylim_vals)
+
+    # Combine and save side-by-side
+    combined_map <- p_state + p_prey + patchwork::plot_layout(nrow = 2)
+    map_out <- file.path(dir_model_out, paste0("Pen", penID, "_HMM_vs_Prey_Map_", bestModelType, ".png"))
+    ggsave(map_out, combined_map, width = 10, height = 14, dpi = 300)
+    cat("✔ Combined state/prey map saved to:", map_out, "\n")
+  }
+}
+
+# Save full model summary
+if (nrow(summaryAllModels) > 0) {
+  allModels_csv <- file.path(dir_model_out, "All_Penguin_Model_Results.csv")
+  readr::write_csv(summaryAllModels, allModels_csv)
+  cat("\n✔ All model AIC/BIC results saved to:", allModels_csv, "\n")
+}
+
+# Save best models as RDS
+models_rds <- file.path(dir_model_out, "Best_HMM_Models.rds")
+saveRDS(bestModels, models_rds)
+cat("\n✔ Best HMM models saved to:", models_rds, "\n")
+```
